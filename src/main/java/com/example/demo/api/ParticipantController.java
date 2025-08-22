@@ -11,8 +11,10 @@ public class ParticipantController {
     public ParticipantController(ParticipantService svc){ this.svc = svc; }
 
     @PostMapping
-    public ResponseEntity<Void> upsertBatch(@RequestBody BatchRequest request){
-        svc.upsertBatch(request);
-        return ResponseEntity.noContent().build(); // 204
+    public ResponseEntity<Void> upsertBatch(@RequestBody BatchRequest request) {
+        boolean createdAny = svc.upsertBatch(request);
+        return createdAny
+                ? ResponseEntity.status(201).build()
+                : ResponseEntity.noContent().build(); // 204
     }
 }

@@ -40,11 +40,46 @@ public class JsonStore {
         }catch(IOException e){ throw new RuntimeException("Write "+file+" failed", e); }
     }
 
+    /** Primary fetch by participantId */
     public synchronized Optional<Map<String,Object>> get(String participantId){
         return Optional.ofNullable(cache.get(participantId));
     }
 
+    /** Update/insert under a specific participantId */
     public synchronized void put(String participantId, Map<String,Object> doc){
         cache.put(participantId, doc);
+    }
+
+    /**
+     * Secondary lookup by (firstName, lastName, email), case-insensitive/trimmed.
+     * Returns the entry (pid + doc) if found, else empty.
+     */
+    public synchronized Optional<Map.Entry<String, Map<String,Object>>> findByNameEmail(
+            String firstName, String lastName, String email) {
+
+        String f = norm(firstName);
+        String l = norm(lastName);
+        String e = norm(email);
+
+        if (f == null || l == null || e == null) return Optional.empty(); // need all 3
+
+        for (var entry : cache.entrySet()) {
+            var doc = entry.getValue();
+            if (eq(norm(doc.get("firstName")), f)
+                    && eq(norm(doc.get("lastName")), l)
+                    && eq(norm(doc.get("email")), e)) {
+                return Optional.of(entry);
+            }
+        }
+        return Optional.empty();
+    }
+
+    /* ---------- helpers ---------- */
+    private static boolean eq(String a, String b){ return Objects.equals(a, b); }
+    private static String norm(Object v) {
+        if (v == null) return null;
+        String s = String.valueOf(v).trim();
+        if (s.isEmpty()) return null;
+        return s.toLowerCase(); // case-insensitive compare
     }
 }
