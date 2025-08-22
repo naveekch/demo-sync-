@@ -4,10 +4,18 @@ import java.util.List;
 import java.util.Map;
 
 public class BatchRequest {
-    public String batchId;
-    public String source;
+    private String batchId;                         // optional
+    private String source;                          // optional
+    private List<Map<String, Object>> participants; // required
 
-    // Each participant is just a Map<String,Object>.
-    // Required fields for our logic: participantId (String), updatedAt (RFC3339 String, optional)
-    public List<Map<String, Object>> participants;
+    public BatchRequest() {}
+
+    public String getBatchId() { return batchId; }
+    public void setBatchId(String batchId) { this.batchId = batchId; }
+
+    public String getSource() { return source; }
+    public void setSource(String source) { this.source = source; }
+
+    public List<Map<String, Object>> getParticipants() { return participants; }
+    public void setParticipants(List<Map<String, Object>> participants) { this.participants = participants; }
 }
