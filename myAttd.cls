@@ -2,7 +2,7 @@
  * @description Apex REST Resource for the true bulk attendance API.
  * This is the single, synchronous entry point for the LDS system. Its only job is to
  * receive the entire payload and enqueue the first-stage asynchronous job (the Dispatcher).
- * @see DAPV1BulkRequest
+ * @see DAPV1AttendanceRequest
  * @see BulkDispatcherQueueable
  */
 @RestResource(urlMapping='/scheduler/v1/attendance')
@@ -15,9 +15,9 @@ global with sharing class DAPV1AttendanceResource {
 
         try {
             // 1. Deserialize the incoming JSON payload into our request object
-            DAPV1BulkRequest requestBody = (DAPV1BulkRequest) JSON.deserialize(
+            DAPV1AttendanceRequest requestBody = (DAPV1AttendanceRequest) JSON.deserialize(
                 req.requestBody.toString(),
-                DAPV1BulkRequest.class
+                DAPV1AttendanceRequest.class
             );
 
             // 2. Basic validation: ensure the top-level appointments list is not empty
@@ -48,7 +48,7 @@ global with sharing class DAPV1AttendanceResource {
 }
 
 // --- Helper class for the JSON Request Body ---
-public with sharing class DAPV1BulkRequest {
+public with sharing class DAPV1AttendanceRequest {
     public List<AppointmentPayload> appointments;
 
     public class AppointmentPayload {
@@ -77,15 +77,15 @@ public with sharing class DAPV1BulkRequest {
  */
 public with sharing class BulkDispatcherQueueable implements Queueable {
 
-    private final List<DAPV1BulkRequest.AppointmentPayload> appointments;
+    private final List<DAPV1AttendanceRequest.AppointmentPayload> appointments;
 
-    public BulkDispatcherQueueable(List<DAPV1BulkRequest.AppointmentPayload> appointments) {
+    public BulkDispatcherQueueable(List<DAPV1AttendanceRequest.AppointmentPayload> appointments) {
         this.appointments = appointments;
     }
 
     public void execute(QueueableContext context) {
         // Loop through each appointment from the original payload
-        for (DAPV1BulkRequest.AppointmentPayload appt : this.appointments) {
+        for (DAPV1AttendanceRequest.AppointmentPayload appt : this.appointments) {
             // For each appointment, enqueue a new, separate Processor job.
             // This breaks the large request into small, independent, and safe units of work.
             if (appt.participants != null && !appt.participants.isEmpty()) {
@@ -104,9 +104,9 @@ public with sharing class BulkDispatcherQueueable implements Queueable {
 public with sharing class BulkProcessorQueueable implements Queueable {
 
     private final String serviceAppointmentId;
-    private final List<DAPV1BulkRequest.ParticipantPayload> participants;
+    private final List<DAPV1AttendanceRequest.ParticipantPayload> participants;
 
-    public BulkProcessorQueueable(String serviceAppointmentId, List<DAPV1BulkRequest.ParticipantPayload> participants) {
+    public BulkProcessorQueueable(String serviceAppointmentId, List<DAPV1AttendanceRequest.ParticipantPayload> participants) {
         this.serviceAppointmentId = serviceAppointmentId;
         this.participants = participants;
     }
@@ -135,7 +135,7 @@ public with sharing class DAPV1BulkPartCreateUseCaseHandler {
     @TestVisible
     private DAPV1SObjEvntAudnceDmlAccessor eventAudienceDmlAccessor = new DAPV1SObjEvntAudnceDmlAccessor();
 
-    public void handle(String serviceAppointmentId, List<DAPV1BulkRequest.ParticipantPayload> participants) {
+    public void handle(String serviceAppointmentId, List<DAPV1AttendanceRequest.ParticipantPayload> participants) {
         // 1. Validate the Service Appointment ID by reusing the existing accessor
         ServiceAppointment parentAppointment = getServiceAppointment(serviceAppointmentId);
         if (parentAppointment == null) {
@@ -153,7 +153,7 @@ public with sharing class DAPV1BulkPartCreateUseCaseHandler {
 
         List<DAP_Event_Participant__c> participantsToInsert = new List<DAP_Event_Participant__c>();
 
-        for (DAPV1BulkRequest.ParticipantPayload p : participants) {
+        for (DAPV1AttendanceRequest.ParticipantPayload p : participants) {
             DAP_Event_Participant__c newParticipant = new DAP_Event_Participant__c(
                 Service_Appointment__c = serviceAppointmentId,
                 ExternalId__c = p.externalId,
@@ -228,9 +228,9 @@ public with sharing class DAPV1BulkPartCreateUseCaseHandler {
     /**
      * @description Queries for all matching Accounts in a single, bulkified query.
      */
-    private Map<String, Id> getMatchingAccounts(List<DAPV1BulkRequest.ParticipantPayload> participants) {
+    private Map<String, Id> getMatchingAccounts(List<DAPV1AttendanceRequest.ParticipantPayload> participants) {
         Set<String> externalIds = new Set<String>();
-        for (DAPV1BulkRequest.ParticipantPayload p : participants) {
+        for (DAPV1AttendanceRequest.ParticipantPayload p : participants) {
             if (String.isNotBlank(p.externalId)) {
                 externalIds.add(p.externalId);
             }
