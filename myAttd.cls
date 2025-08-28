@@ -65,20 +65,7 @@ public with sharing class DAPV1BulkRequest {
         public String zipCode;
         public String status; // Attended/registered/no_show
         public String customerIdtype; // mid/prospectid/memberid
-        public String id;
-        public String timezone;
-        public String meetingMethod;
-        public String participantNotes;
-        public String repNotes;
-        public String registrantCorpId;
-        public String referrerCorpId;
     }
-}
-
-// --- Utility to manage trigger execution ---
-public class DAPTriggerHandlerUtil {
-    @TestVisible
-    public static boolean bypassEventParticipantTrigger = false;
 }
 
 
@@ -144,37 +131,119 @@ public with sharing class BulkProcessorQueueable implements Queueable {
  */
 public with sharing class DAPV1BulkPartCreateUseCaseHandler {
 
+    // Re-use the existing accessor from the 1:1 flow for all Service Appointment queries
+    @TestVisible
+    private DAPV1SObjEvntAudnceDmlAccessor eventAudienceDmlAccessor = new DAPV1SObjEvntAudnceDmlAccessor();
+
     public void handle(String serviceAppointmentId, List<DAPV1BulkRequest.ParticipantPayload> participants) {
+        // 1. Validate the Service Appointment ID by reusing the existing accessor
+        ServiceAppointment parentAppointment = getServiceAppointment(serviceAppointmentId);
+        if (parentAppointment == null) {
+            // Error is logged in the getServiceAppointment method
+            return;
+        }
+
+        /*
+        // --- POC: Customer Matching Logic Commented Out ---
+        // 2. Perform Customer Matching in Bulk
+        Map<String, Id> externalIdToAccountIdMap = getMatchingAccounts(participants);
+        
+        List<Lead> leadsToInsert = new List<Lead>();
+        */
+
         List<DAP_Event_Participant__c> participantsToInsert = new List<DAP_Event_Participant__c>();
 
-        // In a real implementation, this is where you would perform the "upsert" logic,
-        // customer matching (querying for existing Contacts/Leads based on externalId),
-        // and data enrichment. For this example, we'll do a direct mapping.
-
         for (DAPV1BulkRequest.ParticipantPayload p : participants) {
-            // NOTE: Assumes corresponding custom fields exist on DAP_Event_Participant__c
-            participantsToInsert.add(new DAP_Event_Participant__c(
+            DAP_Event_Participant__c newParticipant = new DAP_Event_Participant__c(
                 Service_Appointment__c = serviceAppointmentId,
                 ExternalId__c = p.externalId,
                 CustomerIdType__c = p.customerIdtype,
                 Notification_Email__c = p.email,
-                Status__c = p.status,
-                Participant_Notes__c = p.participantNotes
-                // Map other fields from the payload to the SObject here
-            ));
+                Status__c = p.status
+                // Participant_Notes__c would be mapped from p.participantNotes if it existed
+            );
+
+            /*
+            // --- POC: Account/Lead Linking Logic Commented Out ---
+            // 3. Link to Account or Prepare a New Lead
+            if (externalIdToAccountIdMap.containsKey(p.externalId)) {
+                newParticipant.Account__c = externalIdToAccountIdMap.get(p.externalId);
+            } else {
+                // If no matching account, create a new Lead.
+                leadsToInsert.add(new Lead(
+                    FirstName = p.firstName,
+                    LastName = p.lastName,
+                    Email = p.email,
+                    Company = 'Unknown', // Required field
+                    Status = 'New'
+                ));
+            }
+            */
+            participantsToInsert.add(newParticipant);
         }
 
+        /*
+        // --- POC: Lead Insertion Logic Commented Out ---
+        // 4. Insert any new Leads first
+        if (!leadsToInsert.isEmpty()) {
+            Database.SaveResult[] leadSaveResults = Database.insert(leadsToInsert, false);
+            // Now, link the participants to the newly created leads
+            Integer leadIndex = 0;
+            for(Integer i = 0; i < participantsToInsert.size(); i++){
+                if(participantsToInsert[i].Account__c == null && leadIndex < leadSaveResults.size()){
+                    if(leadSaveResults[leadIndex].isSuccess()){
+                        participantsToInsert[i].Lead__c = leadSaveResults[leadIndex].getId();
+                    }
+                    leadIndex++;
+                }
+            }
+        }
+        */
+
+        // 5. Insert the Event Participants
         if (!participantsToInsert.isEmpty()) {
-            // Delegate to the DML Accessor to perform the database insert
             DAPV1BulkPartDmlAccessor dmlAccessor = new DAPV1BulkPartDmlAccessor();
             dmlAccessor.insertParticipants(participantsToInsert);
 
-            // After successful insert, update the parent Service Appointment status
-            // Note: This assumes the DmlAccessor for ServiceAppointment already exists from the 1:1 flow.
+            // 6. Update the parent Service Appointment status using the existing accessor
             DAPV1SObjSrvcApptDmlAccessor apptAccessor = new DAPV1SObjSrvcApptDmlAccessor();
-            ServiceAppointment parentAppt = new ServiceAppointment(Id = serviceAppointmentId);
-            apptAccessor.updateTrgtSrvcApptStatus(parentAppt, 'Published with Registrations');
+            parentAppointment.Status = 'Published with Registrations';
+            apptAccessor.updateTrgtSrvcApptStatus(parentAppointment, 'Published with Registrations');
         }
+    }
+
+    /**
+     * @description Re-usable method to safely get a Service Appointment, mirroring the 1:1 flow's pattern.
+     */
+    private ServiceAppointment getServiceAppointment(String appointmentId) {
+        try {
+            return this.eventAudienceDmlAccessor.getEventDetail(appointmentId);
+        } catch (Exception e) {
+            // In a production scenario, this would throw a specific exception type
+            System.debug(LoggingLevel.ERROR, 'Service Appointment with ID ' + appointmentId + ' not found.');
+            return null;
+        }
+    }
+
+    /**
+     * @description Queries for all matching Accounts in a single, bulkified query.
+     */
+    private Map<String, Id> getMatchingAccounts(List<DAPV1BulkRequest.ParticipantPayload> participants) {
+        Set<String> externalIds = new Set<String>();
+        for (DAPV1BulkRequest.ParticipantPayload p : participants) {
+            if (String.isNotBlank(p.externalId)) {
+                externalIds.add(p.externalId);
+            }
+        }
+
+        Map<String, Id> results = new Map<String, Id>();
+        if (!externalIds.isEmpty()) {
+            // NOTE: Assumes a custom field 'MID__c' on Account for matching.
+            for (Account acc : [SELECT Id, MID__c FROM Account WHERE MID__c IN :externalIds]) {
+                results.put(acc.MID__c, acc.Id);
+            }
+        }
+        return results;
     }
 }
 
@@ -186,9 +255,6 @@ public with sharing class DAPV1BulkPartCreateUseCaseHandler {
 public with sharing class DAPV1BulkPartDmlAccessor {
 
     public void insertParticipants(List<DAP_Event_Participant__c> participants) {
-        // Set the flag to bypass the Event Participant trigger
-        DAPTriggerHandlerUtil.bypassEventParticipantTrigger = true;
-
         try {
             // Perform the single, bulkified DML operation.
             // Using Database.insert with 'false' allows for partial success.
@@ -198,18 +264,16 @@ public with sharing class DAPV1BulkPartDmlAccessor {
             for (Integer i = 0; i < saveResults.size(); i++) {
                 if (!saveResults[i].isSuccess()) {
                     // For the POC, we just log to the debug log.
-                    // In production, this would write to a custom Integration_Log__c object.
                     Database.Error error = saveResults[i].getErrors()[0];
                     System.debug(LoggingLevel.ERROR, 'Failed to insert participant record. ' +
-                        'ExternalId: ' + participants[i].ExternalId__c + // Assuming you add this field for logging
+                        'ExternalId: ' + participants[i].ExternalId__c + 
                         '. Error: ' + error.getStatusCode() + ' - ' + error.getMessage());
                 }
             }
 
-        } finally {
-            // ALWAYS reset the flag, even if an error occurs, to ensure
-            // the trigger works correctly for other transactions.
-            DAPTriggerHandlerUtil.bypassEventParticipantTrigger = false;
+        } catch (Exception e) {
+            // Catch any unexpected DML exceptions
+             System.debug(LoggingLevel.ERROR, 'An unexpected error occurred during participant insert: ' + e.getMessage());
         }
     }
 }
