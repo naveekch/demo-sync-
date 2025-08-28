@@ -167,6 +167,27 @@ public with sharing class DAPV1BulkPartCreateUseCaseHandler {
                     Notification_Email__c = p.email,
                     Status__c = p.status
                 );
+                
+                /*
+                // --- Production: Customer Matching & Lead Creation Logic (Future State) ---
+                // This logic will be implemented after the POC is complete.
+                // It will find a matching Account or create a new Lead for the participant.
+                
+                // Map<String, Id> externalIdToAccountIdMap = getMatchingAccounts(participants);
+                // List<Lead> leadsToInsert = new List<Lead>();
+
+                // if (externalIdToAccountIdMap.containsKey(p.externalId)) {
+                //     newParticipant.Account__c = externalIdToAccountIdMap.get(p.externalId);
+                // } else {
+                //     leadsToInsert.add(new Lead(
+                //         FirstName = p.firstName,
+                //         LastName = p.lastName,
+                //         Email = p.email,
+                //         Company = 'Unknown',
+                //         Status = 'New'
+                //     ));
+                // }
+                */
                 participantsToInsert.add(newParticipant);
             }
         }
