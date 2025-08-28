@@ -27,12 +27,13 @@ global with sharing class DAPV1AttendanceResource {
                 return;
             }
 
-            // 3. Enqueue the first-stage asynchronous job (the Dispatcher)
-            // This hands off the entire payload for background processing.
+            // 3. Enqueue the first-stage asynchronous job (the Dispatcher).
+            // This hands off the entire payload for safe background processing.
             Id jobId = System.enqueueJob(new BulkDispatcherQueueable(requestBody.appointments));
 
             // 4. Immediately return a 202 Accepted response.
-            // This tells the client we'vereceived the request and it's queued for processing.
+            // This tells the client we've received the request and it's queued for processing.
+            // It does NOT mean the processing is complete.
             res.statusCode = 202;
             res.responseBody = Blob.valueOf(JSON.serialize(new Map<String, String>{
                 'status' => 'Request accepted for processing.',
@@ -49,13 +50,16 @@ global with sharing class DAPV1AttendanceResource {
 
 // --- Helper class for the JSON Request Body ---
 public with sharing class DAPV1AttendanceRequest {
+    // A list of all appointments included in this bulk request
     public List<AppointmentPayload> appointments;
 
+    // Represents a single appointment and its list of participants
     public class AppointmentPayload {
         public String serviceAppointmentId;
         public List<ParticipantPayload> participants;
     }
 
+    // Represents a single participant's data from the source system
     public class ParticipantPayload {
         public String externalId; // lds id
         public String firstName;
@@ -71,8 +75,9 @@ public with sharing class DAPV1AttendanceRequest {
 
 /**
  * @description The "Dispatcher" Queueable job.
- * This first-stage background job receives the entire list of appointments. Its only
- * purpose is to "fan out" the work by creating one "Processor" job for each appointment.
+ * This first-stage background job receives the entire list of appointments from the API.
+ * Its only purpose is to "fan out" the work by creating one "Processor" job for each
+ * individual appointment, ensuring the load is broken into safe, independent chunks.
  * @see BulkProcessorQueueable
  */
 public with sharing class BulkDispatcherQueueable implements Queueable {
@@ -87,7 +92,7 @@ public with sharing class BulkDispatcherQueueable implements Queueable {
         // Loop through each appointment from the original payload
         for (DAPV1AttendanceRequest.AppointmentPayload appt : this.appointments) {
             // For each appointment, enqueue a new, separate Processor job.
-            // This breaks the large request into small, independent, and safe units of work.
+            // This is the "fan-out" step that makes the architecture resilient and scalable.
             if (appt.participants != null && !appt.participants.isEmpty()) {
                 System.enqueueJob(new BulkProcessorQueueable(appt.serviceAppointmentId, appt.participants));
             }
@@ -99,7 +104,7 @@ public with sharing class BulkDispatcherQueueable implements Queueable {
 /**
  * @description The "Processor" Queueable job.
  * This second-stage background job does the actual work of processing all participants
- * for a SINGLE Service Appointment.
+ * for a SINGLE Service Appointment. Each instance of this job runs with its own governor limits.
  */
 public with sharing class BulkProcessorQueueable implements Queueable {
 
@@ -117,7 +122,8 @@ public with sharing class BulkProcessorQueueable implements Queueable {
             DAPV1BulkPartCreateUseCaseHandler handler = new DAPV1BulkPartCreateUseCaseHandler();
             handler.handle(this.serviceAppointmentId, this.participants);
         } catch (Exception e) {
-            // In a production scenario, log this error to a custom logging object
+            // In a production scenario, this error would be written to a custom logging object.
+            // For the POC, we log it to the standard debug log.
             System.debug(LoggingLevel.ERROR, 'Failed to process participants for Appointment ID ' +
                 this.serviceAppointmentId + '. Error: ' + e.getMessage());
         }
@@ -128,6 +134,7 @@ public with sharing class BulkProcessorQueueable implements Queueable {
 /**
  * @description The "Core Engine" or Use Case Handler.
  * Contains the main business logic for processing a list of participants for one event.
+ * This class is called by the Processor job.
  */
 public with sharing class DAPV1BulkPartCreateUseCaseHandler {
 
@@ -139,27 +146,28 @@ public with sharing class DAPV1BulkPartCreateUseCaseHandler {
         // 1. Validate the Service Appointment ID by reusing the existing accessor
         ServiceAppointment parentAppointment = getServiceAppointment(serviceAppointmentId);
         if (parentAppointment == null) {
-            // Error is logged in the getServiceAppointment method
+            // If the appointment doesn't exist, stop processing. The error is logged in the helper method.
             return;
         }
 
         // --- Deduplication Logic ---
-        // 2. Find all existing participants for this event in a single query
+        // 2. Find all existing participants for this event in a single, bulkified query
         Map<String, DAP_Event_Participant__c> existingParticipantsMap = getExistingParticipants(serviceAppointmentId, participants);
 
         List<DAP_Event_Participant__c> participantsToInsert = new List<DAP_Event_Participant__c>();
         List<DAP_Event_Participant__c> participantsToUpdate = new List<DAP_Event_Participant__c>();
 
+        // Loop through the incoming data to determine what needs to be inserted vs. updated
         for (DAPV1AttendanceRequest.ParticipantPayload p : participants) {
-            // Check if a participant with this externalId already exists
+            // Check if a participant with this externalId already exists for this event
             if (existingParticipantsMap.containsKey(p.externalId)) {
-                // It's an UPDATE
+                // It's an UPDATE. Get the existing record and update its status.
                 DAP_Event_Participant__c existingParticipant = existingParticipantsMap.get(p.externalId);
                 existingParticipant.Status__c = p.status; // Update status
-                // Update other fields as needed
+                // Update other fields as needed in the future
                 participantsToUpdate.add(existingParticipant);
             } else {
-                // It's a new INSERT
+                // It's a new INSERT. Create a new participant record.
                 DAP_Event_Participant__c newParticipant = new DAP_Event_Participant__c(
                     Service_Appointment__c = serviceAppointmentId,
                     ExternalId__c = p.externalId,
@@ -170,8 +178,8 @@ public with sharing class DAPV1BulkPartCreateUseCaseHandler {
                 
                 /*
                 // --- Production: Customer Matching & Lead Creation Logic (Future State) ---
-                // This logic will be implemented after the POC is complete.
-                // It will find a matching Account or create a new Lead for the participant.
+                // This logic is commented out for the POC but will be implemented for production.
+                // It will find a matching Account based on externalId or create a new Lead.
                 
                 // Map<String, Id> externalIdToAccountIdMap = getMatchingAccounts(participants);
                 // List<Lead> leadsToInsert = new List<Lead>();
@@ -209,6 +217,9 @@ public with sharing class DAPV1BulkPartCreateUseCaseHandler {
         }
     }
 
+    /**
+     * @description Re-usable method to safely get a Service Appointment, mirroring the 1:1 flow's pattern.
+     */
     private ServiceAppointment getServiceAppointment(String appointmentId) {
         try {
             return this.eventAudienceDmlAccessor.getEventDetail(appointmentId);
@@ -218,7 +229,11 @@ public with sharing class DAPV1BulkPartCreateUseCaseHandler {
         }
     }
     
+    /**
+     * @description Gets all existing participants for a given event and a list of external IDs.
+     */
     private Map<String, DAP_Event_Participant__c> getExistingParticipants(String serviceAppointmentId, List<DAPV1AttendanceRequest.ParticipantPayload> participants) {
+        // Collect all unique external IDs from the incoming payload
         Set<String> externalIds = new Set<String>();
         for(DAPV1AttendanceRequest.ParticipantPayload p : participants) {
             if(String.isNotBlank(p.externalId)) {
@@ -226,6 +241,7 @@ public with sharing class DAPV1BulkPartCreateUseCaseHandler {
             }
         }
 
+        // Perform a single, bulkified query to find all matching records
         Map<String, DAP_Event_Participant__c> results = new Map<String, DAP_Event_Participant__c>();
         if(!externalIds.isEmpty()) {
             for(DAP_Event_Participant__c ep : [
@@ -234,6 +250,7 @@ public with sharing class DAPV1BulkPartCreateUseCaseHandler {
                 WHERE Service_Appointment__c = :serviceAppointmentId
                 AND ExternalId__c IN :externalIds
             ]) {
+                // Organize the results into a Map for fast lookups
                 results.put(ep.ExternalId__c, ep);
             }
         }
@@ -250,6 +267,8 @@ public with sharing class DAPV1BulkPartDmlAccessor {
 
     public void insertParticipants(List<DAP_Event_Participant__c> participants) {
         try {
+            // Using Database.insert with 'false' allows for partial success,
+            // meaning if one record fails, the others can still be inserted.
             Database.SaveResult[] saveResults = Database.insert(participants, false);
             logErrors(saveResults, participants);
         } catch (Exception e) {
@@ -259,6 +278,7 @@ public with sharing class DAPV1BulkPartDmlAccessor {
 
     public void updateParticipants(List<DAP_Event_Participant__c> participants) {
         try {
+            // Using Database.update with 'false' allows for partial success.
             Database.SaveResult[] saveResults = Database.update(participants, false);
             logErrors(saveResults, participants);
         } catch (Exception e) {
@@ -266,6 +286,9 @@ public with sharing class DAPV1BulkPartDmlAccessor {
         }
     }
 
+    /**
+     * @description A helper method to loop through DML results and log any failures.
+     */
     private void logErrors(Database.SaveResult[] results, List<DAP_Event_Participant__c> participants) {
         for (Integer i = 0; i < results.size(); i++) {
             if (!results[i].isSuccess()) {
