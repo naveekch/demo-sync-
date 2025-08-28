@@ -183,7 +183,7 @@ public with sharing class DAPV1BulkPartCreateUseCaseHandler {
                 //         FirstName = p.firstName,
                 //         LastName = p.lastName,
                 //         Email = p.email,
-                //         Company = 'Unknown',
+                //         Company = 'Unknown', // Required field
                 //         Status = 'New'
                 //     ));
                 // }
