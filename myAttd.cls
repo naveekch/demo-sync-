@@ -61,14 +61,14 @@ public with sharing class DAPV1AttendanceRequest {
 
     // Represents a single participant's data from the source system
     public class ParticipantPayload {
-        public String externalId; // lds id
+        public String externalId; 
         public String firstName;
         public String lastName;
         public String email;
         public String phone;
         public String zipCode;
-        public String status; // Attended/registered/no_show
-        public String customerIdtype; // mid/prospectid/memberid
+        public String status;
+        public String customerIdtype;
     }
 }
 
@@ -92,7 +92,6 @@ public with sharing class BulkDispatcherQueueable implements Queueable {
         // Loop through each appointment from the original payload
         for (DAPV1AttendanceRequest.AppointmentPayload appt : this.appointments) {
             // For each appointment, enqueue a new, separate Processor job.
-            // This is the "fan-out" step that makes the architecture resilient and scalable.
             if (appt.participants != null && !appt.participants.isEmpty()) {
                 System.enqueueJob(new BulkProcessorQueueable(appt.serviceAppointmentId, appt.participants));
             }
@@ -109,7 +108,6 @@ public with sharing class BulkDispatcherQueueable implements Queueable {
 public with sharing class BulkProcessorQueueable implements Queueable {
 
     // Define a safe number of records to process in one transaction.
-    // This can be tuned, but 1000 is a safe starting point.
     @TestVisible
     private static final Integer CHUNK_SIZE = 1000;
 
@@ -122,39 +120,28 @@ public with sharing class BulkProcessorQueueable implements Queueable {
     }
 
     public void execute(QueueableContext context) {
-        // --- Chaining Logic: Part 1 - Prepare the current chunk ---
         // Create a list for the current chunk we are going to process in this single job.
         List<DAPV1AttendanceRequest.ParticipantPayload> currentChunk = new List<DAPV1AttendanceRequest.ParticipantPayload>();
 
-        // Process records up to our defined CHUNK_SIZE
+        // Move records from the main list to the current chunk, up to our defined CHUNK_SIZE
         while (currentChunk.size() < CHUNK_SIZE && !participants.isEmpty()) {
             currentChunk.add(participants.remove(0));
         }
 
         try {
-            // --- Do the actual work for the current chunk ---
+            // Do the actual work for the current chunk
             DAPV1BulkPartCreateUseCaseHandler handler = new DAPV1BulkPartCreateUseCaseHandler();
             handler.handle(this.serviceAppointmentId, currentChunk);
         } catch (Exception e) {
-            // In a production scenario, log this error to a custom logging object
+            // For the POC, log any critical errors to the standard debug log.
             System.debug(LoggingLevel.ERROR, 'Failed to process participants for Appointment ID ' +
                 this.serviceAppointmentId + '. Error: ' + e.getMessage());
         } finally {
-            // --- Chaining Logic: Part 2 - Enqueue the next job OR finalize the process ---
+            // After processing the current chunk, check if there are any records left.
             if (!participants.isEmpty()) {
-                // --- THIS IS NOT THE LAST JOB ---
-                // If there are records left, create a new job with the remainder and enqueue it.
-                // This is the "chaining" step that passes the work to the next link.
+                // If yes, create a new job with the remaining records and add it to the queue.
+                // This is the "chaining" step.
                 System.enqueueJob(new BulkProcessorQueueable(this.serviceAppointmentId, participants));
-            } else {
-                // --- THIS IS THE LAST JOB IN THE CHAIN ---
-                // If the participants list is now empty, all work for this appointment is done.
-                // This is the correct and only place to update the parent Service Appointment's status.
-                DAPV1SObjSrvcApptDmlAccessor apptAccessor = new DAPV1SObjSrvcApptDmlAccessor();
-                ServiceAppointment parentAppointment = [SELECT Id, Status FROM ServiceAppointment WHERE Id = :this.serviceAppointmentId];
-                if (parentAppointment != null && parentAppointment.Status != 'Published with Registrations') {
-                    apptAccessor.updateTrgtSrvcApptStatus(parentAppointment, 'Published with Registrations');
-                }
             }
         }
     }
@@ -164,61 +151,50 @@ public with sharing class BulkProcessorQueueable implements Queueable {
 /**
  * @description The "Core Engine" or Use Case Handler.
  * Contains the main business logic for processing a list of participants for one event.
- * This class is called by the Processor job for each chunk.
  */
 public with sharing class DAPV1BulkPartCreateUseCaseHandler {
 
-    // Re-use the existing accessor from the 1:1 flow for all Service Appointment queries
     @TestVisible
     private DAPV1SObjEvntAudnceDmlAccessor eventAudienceDmlAccessor = new DAPV1SObjEvntAudnceDmlAccessor();
 
     public void handle(String serviceAppointmentId, List<DAPV1AttendanceRequest.ParticipantPayload> participants) {
-        // 1. Validate the Service Appointment ID by reusing the existing accessor
+        // 1. Validate the Service Appointment ID
         ServiceAppointment parentAppointment = getServiceAppointment(serviceAppointmentId);
         if (parentAppointment == null) {
-            return; // Error is logged in helper method
+            return; 
         }
 
-        // --- Deduplication Logic ---
-        // 2. Find all existing participants for this event in a single, bulkified query
+        // --- Deduplication Logic (Using Existing Fields for POC) ---
+        // 2. Find all existing participants for this event to perform an "upsert"
         Map<String, DAP_Event_Participant__c> existingParticipantsMap = getExistingParticipants(serviceAppointmentId, participants);
 
         List<DAP_Event_Participant__c> participantsToInsert = new List<DAP_Event_Participant__c>();
         List<DAP_Event_Participant__c> participantsToUpdate = new List<DAP_Event_Participant__c>();
 
         for (DAPV1AttendanceRequest.ParticipantPayload p : participants) {
-            if (existingParticipantsMap.containsKey(p.externalId)) {
+            // Create a composite key for matching based on existing fields
+            String compositeKey = p.firstName + p.lastName + p.email;
+            
+            if (existingParticipantsMap.containsKey(compositeKey)) {
                 // It's an UPDATE.
-                DAP_Event_Participant__c existingParticipant = existingParticipantsMap.get(p.externalId);
+                DAP_Event_Participant__c existingParticipant = existingParticipantsMap.get(compositeKey);
                 existingParticipant.Status__c = p.status;
                 participantsToUpdate.add(existingParticipant);
             } else {
                 // It's a new INSERT.
                 DAP_Event_Participant__c newParticipant = new DAP_Event_Participant__c(
                     Service_Appointment__c = serviceAppointmentId,
-                    ExternalId__c = p.externalId,
-                    CustomerIdType__c = p.customerIdtype,
                     Notification_Email__c = p.email,
                     Status__c = p.status
+                    // TODO: Map FirstName and LastName to the correct fields on the SObject
                 );
                 
                 /*
-                // --- Production: Customer Matching & Lead Creation Logic (Future State) ---
-                // This logic is commented out for the POC but will be implemented for production.
-                // It will find a matching Account based on externalId or create a new Lead.
-                
-                // Map<String, Id> externalIdToAccountIdMap = getMatchingAccounts(participants);
-                // List<Lead> leadsToInsert = new List<Lead>();
-
-                // if (externalIdToAccountIdMap.containsKey(p.externalId)) {
-                //     newParticipant.Account__c = externalIdToAccountIdMap.get(p.externalId);
-                // } else {
-                //     leadsToInsert.add(new Lead(
-                //         FirstName = p.firstName, LastName = p.lastName, Email = p.email,
-                //         Company = 'Unknown', Status = 'New'
-                //     ));
-                // }
+                // --- POC: Future fields Commented Out ---
+                // newParticipant.ExternalId__c = p.externalId;
+                // newParticipant.CustomerIdType__c = p.customerIdtype;
                 */
+
                 participantsToInsert.add(newParticipant);
             }
         }
@@ -231,8 +207,12 @@ public with sharing class DAPV1BulkPartCreateUseCaseHandler {
         if (!participantsToUpdate.isEmpty()) {
             dmlAccessor.updateParticipants(participantsToUpdate);
         }
-
-        // NOTE: The final status update is now handled by the last job in the Processor chain.
+        
+        // 4. Update the parent Service Appointment status
+        if (!participantsToInsert.isEmpty() || !participantsToUpdate.isEmpty()) {
+            DAPV1SObjSrvcApptDmlAccessor apptAccessor = new DAPV1SObjSrvcApptDmlAccessor();
+            apptAccessor.updateTrgtSrvcApptStatus(parentAppointment, 'Published with Registrations');
+        }
     }
 
     private ServiceAppointment getServiceAppointment(String appointmentId) {
@@ -243,24 +223,31 @@ public with sharing class DAPV1BulkPartCreateUseCaseHandler {
             return null;
         }
     }
-    
+
     private Map<String, DAP_Event_Participant__c> getExistingParticipants(String serviceAppointmentId, List<DAPV1AttendanceRequest.ParticipantPayload> participants) {
-        Set<String> externalIds = new Set<String>();
+        // Collect identifying information from the payload
+        Set<String> emails = new Set<String>();
+        // TODO: Add sets for first names and last names for a more precise query
         for(DAPV1AttendanceRequest.ParticipantPayload p : participants) {
-            if(String.isNotBlank(p.externalId)) {
-                externalIds.add(p.externalId);
+            if(String.isNotBlank(p.email)) {
+                emails.add(p.email);
             }
         }
 
         Map<String, DAP_Event_Participant__c> results = new Map<String, DAP_Event_Participant__c>();
-        if(!externalIds.isEmpty()) {
+        if(!emails.isEmpty()) {
+            // Query for existing participants based on a combination of existing fields
+            // NOTE: This assumes the combination of FirstName, LastName, and Email is unique per event
             for(DAP_Event_Participant__c ep : [
-                SELECT Id, ExternalId__c, Status__c
+                SELECT Id, Status__c, /* TODO: Query for FirstName/LastName fields */ Notification_Email__c
                 FROM DAP_Event_Participant__c
                 WHERE Service_Appointment__c = :serviceAppointmentId
-                AND ExternalId__c IN :externalIds
+                AND Notification_Email__c IN :emails
+                // TODO: Add AND FirstName IN :firstNames AND LastName IN :lastNames
             ]) {
-                results.put(ep.ExternalId__c, ep);
+                // Create the same composite key for the map
+                String compositeKey = '' /*ep.FirstName*/ + '' /*ep.LastName*/ + ep.Notification_Email__c;
+                results.put(compositeKey, ep);
             }
         }
         return results;
@@ -270,7 +257,6 @@ public with sharing class DAPV1BulkPartCreateUseCaseHandler {
 
 /**
  * @description DML Accessor for bulk participant operations.
- * Handles the actual database interactions in a bulk-safe manner.
  */
 public with sharing class DAPV1BulkPartDmlAccessor {
 
@@ -292,13 +278,13 @@ public with sharing class DAPV1BulkPartDmlAccessor {
         }
     }
 
-    private void logErrors(Database.SaveResult[] results, List<SObject> records) {
+    private void logErrors(Database.SaveResult[] results, List<DAP_Event_Participant__c> records) {
         for (Integer i = 0; i < results.size(); i++) {
             if (!results[i].isSuccess()) {
                 Database.Error error = results[i].getErrors()[0];
                 DAP_Event_Participant__c failedParticipant = (DAP_Event_Participant__c)records[i];
                 System.debug(LoggingLevel.ERROR, 'Failed to process participant record. ' +
-                    'ExternalId: ' + failedParticipant.ExternalId__c + 
+                    'Email: ' + failedParticipant.Notification_Email__c + 
                     '. Error: ' + error.getStatusCode() + ' - ' + error.getMessage());
             }
         }
