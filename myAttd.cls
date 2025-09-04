@@ -184,55 +184,74 @@ public with sharing class DAPV1BulkPartCreateUseCaseHandler {
         }
         System.debug(LoggingLevel.INFO, 'Service Appointment validated successfully.');
 
-        /*
-        // --- POC: Deduplication Logic Commented Out ---
-        // In the final version, we will first query for existing participants
-        // to perform an "upsert" (update or insert) operation. For the POC,
-        // we will only perform inserts.
-        
-        // Map<String, DAP_Event_Participant__c> existingParticipantsMap = getExistingParticipants(serviceAppointmentId, participants);
-        // List<DAP_Event_Participant__c> participantsToUpdate = new List<DAP_Event_Participant__c>();
-        */
+        // --- Deduplication Logic ---
+        // 2. Find all existing participants for this event in a single, bulkified query
+        Map<String, DAP_Event_Participant__c> existingParticipantsMap = getExistingParticipants(serviceAppointmentId, participants);
+        System.debug(LoggingLevel.INFO, 'Found ' + existingParticipantsMap.size() + ' existing participants for this event.');
 
         List<DAP_Event_Participant__c> participantsToInsert = new List<DAP_Event_Participant__c>();
+        List<DAP_Event_Participant__c> participantsToUpdate = new List<DAP_Event_Participant__c>();
 
+        // Loop through the incoming data to determine what needs to be inserted vs. updated
         for (DAPV1AttendanceRequest.ParticipantPayload p : participants) {
-            
-            // For the POC, we are only inserting new records.
-            DAP_Event_Participant__c newParticipant = new DAP_Event_Participant__c(
-                Service_Appointment__c = serviceAppointmentId,
-                Notification_Email__c = p.email,
-                Status__c = p.status,
-                Meeting_Method__c = 'Virtual' // <-- BUG FIX: Add the required Meeting Method
-            );
-            
-            /*
-            // --- POC: Future fields Commented Out ---
-            // These fields do not exist yet, so they are commented out.
-            // Once created, we will uncomment these lines.
-            
-            // newParticipant.ExternalId__c = p.externalId;
-            // newParticipant.CustomerIdType__c = p.customerIdtype;
-            */
+            // Check if a participant with this externalId already exists for this event
+            if (existingParticipantsMap.containsKey(p.externalId)) {
+                // It's an UPDATE. Get the existing record and update its status.
+                DAP_Event_Participant__c existingParticipant = existingParticipantsMap.get(p.externalId);
+                existingParticipant.Status__c = p.status; // Update status
+                participantsToUpdate.add(existingParticipant);
+            } else {
+                // It's a new INSERT. Create a new participant record.
+                DAP_Event_Participant__c newParticipant = new DAP_Event_Participant__c(
+                    Service_Appointment__c = serviceAppointmentId,
+                    Notification_Email__c = p.email,
+                    Status__c = p.status,
+                    Meeting_Method__c = 'Virtual' // <-- BUG FIX: Add the required Meeting Method
+                );
+                
+                /*
+                // --- POC: Future fields Commented Out ---
+                // These fields do not exist yet, so they are commented out.
+                
+                // newParticipant.ExternalId__c = p.externalId;
+                // newParticipant.CustomerIdType__c = p.customerIdtype;
+                */
 
-            /*
-            // --- Production: Customer Matching & Lead Creation Logic (Future State) ---
-            // This logic will be implemented after the POC.
-            // Map<String, Id> externalIdToAccountIdMap = getMatchingAccounts(participants);
-            // etc...
-            */
-            participantsToInsert.add(newParticipant);
+                /*
+                // --- Production: Customer Matching & Lead Creation Logic (Future State) ---
+                // This logic is commented out for the POC but will be implemented for production.
+                
+                // Map<String, Id> externalIdToAccountIdMap = getMatchingAccounts(participants);
+                // List<Lead> leadsToInsert = new List<Lead>();
+
+                // if (externalIdToAccountIdMap.containsKey(p.externalId)) {
+                //     newParticipant.Account__c = externalIdToAccountIdMap.get(p.externalId);
+                // } else {
+                //     leadsToInsert.add(new Lead(
+                //         FirstName = p.firstName,
+                //         LastName = p.lastName,
+                //         Email = p.email,
+                //         Company = 'Unknown', // Required field
+                //         Status = 'New'
+                //     ));
+                // }
+                */
+                participantsToInsert.add(newParticipant);
+            }
         }
-        System.debug(LoggingLevel.INFO, 'Prepared ' + participantsToInsert.size() + ' participant records for insertion.');
+        System.debug(LoggingLevel.INFO, 'Prepared ' + participantsToInsert.size() + ' records for insert and ' + participantsToUpdate.size() + ' for update.');
 
         // 3. Perform DML Operations
         DAPV1BulkPartDmlAccessor dmlAccessor = new DAPV1BulkPartDmlAccessor();
         if (!participantsToInsert.isEmpty()) {
             dmlAccessor.insertParticipants(participantsToInsert);
         }
+        if (!participantsToUpdate.isEmpty()) {
+            dmlAccessor.updateParticipants(participantsToUpdate);
+        }
         
         // 4. Update the parent Service Appointment status
-        if (!participantsToInsert.isEmpty()) {
+        if (!participantsToInsert.isEmpty() || !participantsToUpdate.isEmpty()) {
             System.debug(LoggingLevel.INFO, 'Updating parent Service Appointment status.');
             DAPV1SObjSrvcApptDmlAccessor apptAccessor = new DAPV1SObjSrvcApptDmlAccessor();
             apptAccessor.updateTrgtSrvcApptStatus(parentAppointment, 'Published with Registrations');
@@ -247,6 +266,34 @@ public with sharing class DAPV1BulkPartCreateUseCaseHandler {
             System.debug(LoggingLevel.ERROR, 'Service Appointment with ID ' + appointmentId + ' not found.');
             return null;
         }
+    }
+    
+    /**
+     * @description Gets all existing participants for a given event and a list of external IDs.
+     */
+    private Map<String, DAP_Event_Participant__c> getExistingParticipants(String serviceAppointmentId, List<DAPV1AttendanceRequest.ParticipantPayload> participants) {
+        // Collect all unique external IDs from the incoming payload
+        Set<String> externalIds = new Set<String>();
+        for(DAPV1AttendanceRequest.ParticipantPayload p : participants) {
+            if(String.isNotBlank(p.externalId)) {
+                externalIds.add(p.externalId);
+            }
+        }
+
+        // Perform a single, bulkified query to find all matching records
+        Map<String, DAP_Event_Participant__c> results = new Map<String, DAP_Event_Participant__c>();
+        if(!externalIds.isEmpty()) {
+            for(DAP_Event_Participant__c ep : [
+                SELECT Id, ExternalId__c, Status__c
+                FROM DAP_Event_Participant__c
+                WHERE Service_Appointment__c = :serviceAppointmentId
+                AND ExternalId__c IN :externalIds
+            ]) {
+                // Organize the results into a Map for fast lookups
+                results.put(ep.ExternalId__c, ep);
+            }
+        }
+        return results;
     }
 }
 
@@ -267,15 +314,29 @@ public with sharing class DAPV1BulkPartDmlAccessor {
         }
     }
 
+    public void updateParticipants(List<DAP_Event_Participant__c> participants) {
+        System.debug(LoggingLevel.INFO, 'DAPV1BulkPartDmlAccessor: Attempting to update ' + participants.size() + ' participant records.');
+        try {
+            // Using Database.update with 'false' allows for partial success.
+            Database.SaveResult[] saveResults = Database.update(participants, false);
+            logErrors(saveResults, participants);
+        } catch (Exception e) {
+             System.debug(LoggingLevel.ERROR, 'An unexpected error occurred during participant update: ' + e.getMessage());
+        }
+    }
+
+    /**
+     * @description A helper method to loop through DML results and log any failures.
+     */
     private void logErrors(Database.SaveResult[] results, List<DAP_Event_Participant__c> records) {
         for (Integer i = 0; i < results.size(); i++) {
             if (!results[i].isSuccess()) {
                 Database.Error error = results[i].getErrors()[0];
-                DAP_Event_Participant__c failedParticipant = (DAP_Event_Participant__c)records[i];
+                DAP_Event_Participant__c failedRecord = records[i];
                 // For the POC, we can't log ExternalId as it doesn't exist yet.
                 // We'll log the email as an identifier instead.
                 System.debug(LoggingLevel.ERROR, 'Failed to process participant record. ' +
-                    'Email: ' + failedParticipant.Notification_Email__c + 
+                    'Email: ' + failedRecord.Notification_Email__c + 
                     '. Error: ' + error.getStatusCode() + ' - ' + error.getMessage());
             }
         }
