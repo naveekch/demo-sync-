@@ -104,9 +104,14 @@ public with sharing class BulkDispatcherQueueable implements Queueable {
 /**
  * @description The "Processor" Queueable job.
  * This second-stage background job does the actual work of processing all participants
- * for a SINGLE Service Appointment. Each instance of this job runs with its own governor limits.
+ * for a SINGLE Service Appointment. It includes "chaining" logic to handle large volumes.
  */
 public with sharing class BulkProcessorQueueable implements Queueable {
+
+    // Define a safe number of records to process in one transaction.
+    // This can be tuned, but 1000 is a safe starting point.
+    @TestVisible
+    private static final Integer CHUNK_SIZE = 1000;
 
     private final String serviceAppointmentId;
     private final List<DAPV1AttendanceRequest.ParticipantPayload> participants;
@@ -117,15 +122,32 @@ public with sharing class BulkProcessorQueueable implements Queueable {
     }
 
     public void execute(QueueableContext context) {
+        // --- Chaining Logic: Part 1 - Prepare the current chunk ---
+        // Create a list for the current chunk we are going to process in this single job.
+        List<DAPV1AttendanceRequest.ParticipantPayload> currentChunk = new List<DAPV1AttendanceRequest.ParticipantPayload>();
+
+        // Process records up to our defined CHUNK_SIZE
+        while (currentChunk.size() < CHUNK_SIZE && !participants.isEmpty()) {
+            currentChunk.add(participants.remove(0));
+        }
+
         try {
-            // Instantiate the Use Case Handler to orchestrate the business logic
+            // --- Do the actual work for the current chunk ---
             DAPV1BulkPartCreateUseCaseHandler handler = new DAPV1BulkPartCreateUseCaseHandler();
-            handler.handle(this.serviceAppointmentId, this.participants);
+            handler.handle(this.serviceAppointmentId, currentChunk);
         } catch (Exception e) {
-            // In a production scenario, this error would be written to a custom logging object.
-            // For the POC, we log it to the standard debug log.
+            // In a production scenario, log this error to a custom logging object
             System.debug(LoggingLevel.ERROR, 'Failed to process participants for Appointment ID ' +
                 this.serviceAppointmentId + '. Error: ' + e.getMessage());
+        } finally {
+            // --- Chaining Logic: Part 2 - Enqueue the next job if needed ---
+            // After processing the current chunk, check if there are any records left.
+            if (!participants.isEmpty()) {
+                // If yes, create a new job with the remaining records and add it to the queue.
+                // This is the "chaining" step that allows us to process thousands of records
+                // for a single appointment without hitting governor limits.
+                System.enqueueJob(new BulkProcessorQueueable(this.serviceAppointmentId, participants));
+            }
         }
     }
 }
@@ -164,7 +186,6 @@ public with sharing class DAPV1BulkPartCreateUseCaseHandler {
                 // It's an UPDATE. Get the existing record and update its status.
                 DAP_Event_Participant__c existingParticipant = existingParticipantsMap.get(p.externalId);
                 existingParticipant.Status__c = p.status; // Update status
-                // Update other fields as needed in the future
                 participantsToUpdate.add(existingParticipant);
             } else {
                 // It's a new INSERT. Create a new participant record.
@@ -300,3 +321,4 @@ public with sharing class DAPV1BulkPartDmlAccessor {
         }
     }
 }
+
