@@ -140,13 +140,21 @@ public with sharing class BulkProcessorQueueable implements Queueable {
             System.debug(LoggingLevel.ERROR, 'Failed to process participants for Appointment ID ' +
                 this.serviceAppointmentId + '. Error: ' + e.getMessage());
         } finally {
-            // --- Chaining Logic: Part 2 - Enqueue the next job if needed ---
-            // After processing the current chunk, check if there are any records left.
+            // --- Chaining Logic: Part 2 - Enqueue the next job OR finalize the process ---
             if (!participants.isEmpty()) {
-                // If yes, create a new job with the remaining records and add it to the queue.
-                // This is the "chaining" step that allows us to process thousands of records
-                // for a single appointment without hitting governor limits.
+                // --- THIS IS NOT THE LAST JOB ---
+                // If there are records left, create a new job with the remainder and enqueue it.
+                // This is the "chaining" step that passes the work to the next link.
                 System.enqueueJob(new BulkProcessorQueueable(this.serviceAppointmentId, participants));
+            } else {
+                // --- THIS IS THE LAST JOB IN THE CHAIN ---
+                // If the participants list is now empty, all work for this appointment is done.
+                // This is the correct and only place to update the parent Service Appointment's status.
+                DAPV1SObjSrvcApptDmlAccessor apptAccessor = new DAPV1SObjSrvcApptDmlAccessor();
+                ServiceAppointment parentAppointment = [SELECT Id, Status FROM ServiceAppointment WHERE Id = :this.serviceAppointmentId];
+                if (parentAppointment != null && parentAppointment.Status != 'Published with Registrations') {
+                    apptAccessor.updateTrgtSrvcApptStatus(parentAppointment, 'Published with Registrations');
+                }
             }
         }
     }
@@ -156,7 +164,7 @@ public with sharing class BulkProcessorQueueable implements Queueable {
 /**
  * @description The "Core Engine" or Use Case Handler.
  * Contains the main business logic for processing a list of participants for one event.
- * This class is called by the Processor job.
+ * This class is called by the Processor job for each chunk.
  */
 public with sharing class DAPV1BulkPartCreateUseCaseHandler {
 
@@ -168,8 +176,7 @@ public with sharing class DAPV1BulkPartCreateUseCaseHandler {
         // 1. Validate the Service Appointment ID by reusing the existing accessor
         ServiceAppointment parentAppointment = getServiceAppointment(serviceAppointmentId);
         if (parentAppointment == null) {
-            // If the appointment doesn't exist, stop processing. The error is logged in the helper method.
-            return;
+            return; // Error is logged in helper method
         }
 
         // --- Deduplication Logic ---
@@ -179,16 +186,14 @@ public with sharing class DAPV1BulkPartCreateUseCaseHandler {
         List<DAP_Event_Participant__c> participantsToInsert = new List<DAP_Event_Participant__c>();
         List<DAP_Event_Participant__c> participantsToUpdate = new List<DAP_Event_Participant__c>();
 
-        // Loop through the incoming data to determine what needs to be inserted vs. updated
         for (DAPV1AttendanceRequest.ParticipantPayload p : participants) {
-            // Check if a participant with this externalId already exists for this event
             if (existingParticipantsMap.containsKey(p.externalId)) {
-                // It's an UPDATE. Get the existing record and update its status.
+                // It's an UPDATE.
                 DAP_Event_Participant__c existingParticipant = existingParticipantsMap.get(p.externalId);
-                existingParticipant.Status__c = p.status; // Update status
+                existingParticipant.Status__c = p.status;
                 participantsToUpdate.add(existingParticipant);
             } else {
-                // It's a new INSERT. Create a new participant record.
+                // It's a new INSERT.
                 DAP_Event_Participant__c newParticipant = new DAP_Event_Participant__c(
                     Service_Appointment__c = serviceAppointmentId,
                     ExternalId__c = p.externalId,
@@ -209,11 +214,8 @@ public with sharing class DAPV1BulkPartCreateUseCaseHandler {
                 //     newParticipant.Account__c = externalIdToAccountIdMap.get(p.externalId);
                 // } else {
                 //     leadsToInsert.add(new Lead(
-                //         FirstName = p.firstName,
-                //         LastName = p.lastName,
-                //         Email = p.email,
-                //         Company = 'Unknown', // Required field
-                //         Status = 'New'
+                //         FirstName = p.firstName, LastName = p.lastName, Email = p.email,
+                //         Company = 'Unknown', Status = 'New'
                 //     ));
                 // }
                 */
@@ -230,17 +232,9 @@ public with sharing class DAPV1BulkPartCreateUseCaseHandler {
             dmlAccessor.updateParticipants(participantsToUpdate);
         }
 
-        // 4. Update the parent Service Appointment status using the existing accessor
-        if (!participantsToInsert.isEmpty() || !participantsToUpdate.isEmpty()) {
-            DAPV1SObjSrvcApptDmlAccessor apptAccessor = new DAPV1SObjSrvcApptDmlAccessor();
-            parentAppointment.Status = 'Published with Registrations';
-            apptAccessor.updateTrgtSrvcApptStatus(parentAppointment, 'Published with Registrations');
-        }
+        // NOTE: The final status update is now handled by the last job in the Processor chain.
     }
 
-    /**
-     * @description Re-usable method to safely get a Service Appointment, mirroring the 1:1 flow's pattern.
-     */
     private ServiceAppointment getServiceAppointment(String appointmentId) {
         try {
             return this.eventAudienceDmlAccessor.getEventDetail(appointmentId);
@@ -250,11 +244,7 @@ public with sharing class DAPV1BulkPartCreateUseCaseHandler {
         }
     }
     
-    /**
-     * @description Gets all existing participants for a given event and a list of external IDs.
-     */
     private Map<String, DAP_Event_Participant__c> getExistingParticipants(String serviceAppointmentId, List<DAPV1AttendanceRequest.ParticipantPayload> participants) {
-        // Collect all unique external IDs from the incoming payload
         Set<String> externalIds = new Set<String>();
         for(DAPV1AttendanceRequest.ParticipantPayload p : participants) {
             if(String.isNotBlank(p.externalId)) {
@@ -262,7 +252,6 @@ public with sharing class DAPV1BulkPartCreateUseCaseHandler {
             }
         }
 
-        // Perform a single, bulkified query to find all matching records
         Map<String, DAP_Event_Participant__c> results = new Map<String, DAP_Event_Participant__c>();
         if(!externalIds.isEmpty()) {
             for(DAP_Event_Participant__c ep : [
@@ -271,7 +260,6 @@ public with sharing class DAPV1BulkPartCreateUseCaseHandler {
                 WHERE Service_Appointment__c = :serviceAppointmentId
                 AND ExternalId__c IN :externalIds
             ]) {
-                // Organize the results into a Map for fast lookups
                 results.put(ep.ExternalId__c, ep);
             }
         }
@@ -288,8 +276,6 @@ public with sharing class DAPV1BulkPartDmlAccessor {
 
     public void insertParticipants(List<DAP_Event_Participant__c> participants) {
         try {
-            // Using Database.insert with 'false' allows for partial success,
-            // meaning if one record fails, the others can still be inserted.
             Database.SaveResult[] saveResults = Database.insert(participants, false);
             logErrors(saveResults, participants);
         } catch (Exception e) {
@@ -299,7 +285,6 @@ public with sharing class DAPV1BulkPartDmlAccessor {
 
     public void updateParticipants(List<DAP_Event_Participant__c> participants) {
         try {
-            // Using Database.update with 'false' allows for partial success.
             Database.SaveResult[] saveResults = Database.update(participants, false);
             logErrors(saveResults, participants);
         } catch (Exception e) {
@@ -307,15 +292,13 @@ public with sharing class DAPV1BulkPartDmlAccessor {
         }
     }
 
-    /**
-     * @description A helper method to loop through DML results and log any failures.
-     */
-    private void logErrors(Database.SaveResult[] results, List<DAP_Event_Participant__c> participants) {
+    private void logErrors(Database.SaveResult[] results, List<SObject> records) {
         for (Integer i = 0; i < results.size(); i++) {
             if (!results[i].isSuccess()) {
                 Database.Error error = results[i].getErrors()[0];
+                DAP_Event_Participant__c failedParticipant = (DAP_Event_Participant__c)records[i];
                 System.debug(LoggingLevel.ERROR, 'Failed to process participant record. ' +
-                    'ExternalId: ' + participants[i].ExternalId__c + 
+                    'ExternalId: ' + failedParticipant.ExternalId__c + 
                     '. Error: ' + error.getStatusCode() + ' - ' + error.getMessage());
             }
         }
