@@ -1,88 +1,115 @@
 /**
- * This is the main entrypoint for the bulk attendance API.
- * It's designed to be a fast, synchronous "hand-off". It takes the big payload,
- * uses a "bin packing" algorithm to break it into safe chunks, and then enqueues
- * a separate job for each chunk.
+ * (UAT-READY VERSION)
+ * This is the main entrypoint for the bulk attendance API. It uses a "bin packing"
+ * algorithm that intentionally splits large appointments across multiple bins to test
+ * concurrent parent record locking during UAT.
  */
-@RestResource(urlMapping='/scheduler/v1/attendance')
+@RestResource(urlMapping='/scheduler/v1/targeted-appointments/participants')
 global with sharing class DAPV1AttendanceResource {
 
     // The max number of participants we'll stuff into a single background job.
-    @TestVisible private static final Integer BIN_CAPACITY = 500;
+    @TestVisible private static final Integer BIN_CAPACITY = 100;
 
     @HttpPost
     global static void processAttendance() {
         RestRequest req = RestContext.request;
         RestResponse res = RestContext.response;
+        String fsReqId = req.headers.get(DAPV1SchedulerConstants.HTTP_HEADER_FSREQ_ID);
         
         try {
             DAPV1AttendanceRequest requestBody = (DAPV1AttendanceRequest) JSON.deserialize(
                 req.requestBody.toString(), DAPV1AttendanceRequest.class
             );
 
+            // Use the centralized logging utility for validation errors.
             if (requestBody == null || requestBody.appointments == null || requestBody.appointments.isEmpty()) {
-                res.statusCode = 400;
-                res.responseBody = Blob.valueOf('{"error": "The \'appointments\' list cannot be null or empty."}');
-                return;
+                DAPV1SchedulerApiLoggingUtil.logAndThrowSchedulerApiException(
+                    DAPV1SchedulerConstants.ERROR_CODE_BAD_REQUEST, 
+                    'The \'appointments\' list cannot be null or empty.', 
+                    DAPV1SchedulerConstants.HTTP_STATUS_CODE_BAD_REQUEST, 
+                    fsReqId, 
+                    DAPV1AttendanceResource.class
+                );
             }
 
-            List<List<DAPV1AttendanceRequest.AppointmentPayload>> bins = packIntoBins(requestBody.appointments);
+            // Create a master tracking record for the entire request.
+            DAP_Bulk_Attendance_Run__c masterRun = new DAP_Bulk_Attendance_Run__c(
+                Status__c = 'Queued'
+            );
+            insert masterRun;
 
-            for (List<DAPV1AttendanceRequest.AppointmentPayload> bin : bins) {
-                if (!bin.isEmpty()) {
-                    // Enqueue the "All-in-One" processor job for the test
-                    System.enqueueJob(new DAPV1ParticipantBinProcessorQueueable(bin));
-                }
+            // This binning logic now splits large appointments across multiple jobs.
+            List<DAPV1ParticipantBinProcessorQueueable> jobsToEnqueue = packIntoBinsAndCreateJobs(requestBody.appointments, masterRun.Id);
+
+            for (DAPV1ParticipantBinProcessorQueueable job : jobsToEnqueue) {
+                System.enqueueJob(job);
             }
 
-            res.statusCode = 202;
-            res.responseBody = Blob.valueOf(JSON.serialize(new Map<String, String>{
-                'status' => 'Request accepted for processing.',
-                'jobId' => 'Multiple jobs enqueued (' + bins.size() + ' bins created)'
-            }));
+            // (FIXED) Create a dedicated response object and use a helper method for consistency.
+            DAPV1AttendanceResponse responsePayload = new DAPV1AttendanceResponse();
+            responsePayload.status = 'Request accepted for processing.';
+            responsePayload.runId = masterRun.Id;
+            responsePayload.jobsEnqueued = jobsToEnqueue.size();
+            
+            updateAcceptedResponse(res, responsePayload);
 
         } catch (Exception e) {
-            res.statusCode = 500;
-            res.responseBody = Blob.valueOf('{"error": "' + e.getMessage() + '"}');
+            // Use the centralized exception handler for consistent error responses.
+            DAPV1ExceptionHandler.handleException(e, res, fsReqId);
         }
     }
     
-    // The bin packing logic remains the same.
-    private static List<List<DAPV1AttendanceRequest.AppointmentPayload>> packIntoBins(List<DAPV1AttendanceRequest.AppointmentPayload> allAppointments) {
-        List<List<DAPV1AttendanceRequest.AppointmentPayload>> bins = new List<List<DAPV1AttendanceRequest.AppointmentPayload>>();
-        List<Integer> binCounts = new List<Integer>();
-        Set<String> processedAppointmentIds = new Set<String>();
-
+    /**
+     * (TEST VERSION) This "bin packing" logic has been rewritten.
+     * It now intentionally splits a single large appointment across multiple bins
+     * and passes the master runId to each job.
+     */
+    private static List<DAPV1ParticipantBinProcessorQueueable> packIntoBinsAndCreateJobs(List<DAPV1AttendanceRequest.AppointmentPayload> allAppointments, Id runId) {
+        List<DAPV1ParticipantBinProcessorQueueable> jobs = new List<DAPV1ParticipantBinProcessorQueueable>();
+        
         for (DAPV1AttendanceRequest.AppointmentPayload appt : allAppointments) {
-            if (appt == null || String.isBlank(appt.serviceAppointmentId)) continue;
-            if (processedAppointmentIds.contains(appt.serviceAppointmentId)) continue;
-
-            Integer participantCount = (appt.participants != null) ? appt.participants.size() : 0;
-            if (participantCount == 0) continue;
-
-            Boolean placed = false;
-            for (Integer i = 0; i < bins.size(); i++) {
-                if (binCounts[i] + participantCount <= BIN_CAPACITY) {
-                    bins[i].add(appt);
-                    binCounts[i] += participantCount;
-                    placed = true;
-                    break;
+            if (appt == null || String.isBlank(appt.serviceAppointmentId) || appt.participants == null || appt.participants.isEmpty()) continue;
+            
+            if (appt.participants.size() <= BIN_CAPACITY) {
+                jobs.add(new DAPV1ParticipantBinProcessorQueueable(new List<DAPV1AttendanceRequest.AppointmentPayload>{appt}, true, runId));
+            } 
+            else {
+                Integer participantIndex = 0;
+                while(participantIndex < appt.participants.size()) {
+                    Integer endIndex = Math.min(appt.participants.size(), participantIndex + BIN_CAPACITY);
+                    
+                    List<DAPV1AttendanceRequest.ParticipantPayload> chunk = new List<DAPV1AttendanceRequest.ParticipantPayload>();
+                    for (Integer i = participantIndex; i < endIndex; i++) {
+                        chunk.add(appt.participants[i]);
+                    }
+                    
+                    DAPV1AttendanceRequest.AppointmentPayload chunkedAppt = new DAPV1AttendanceRequest.AppointmentPayload();
+                    chunkedAppt.serviceAppointmentId = appt.serviceAppointmentId;
+                    chunkedAppt.participants = chunk;
+                    
+                    Boolean isFinal = (endIndex >= appt.participants.size());
+                    
+                    jobs.add(new DAPV1ParticipantBinProcessorQueueable(new List<DAPV1AttendanceRequest.AppointmentPayload>{chunkedAppt}, isFinal, runId));
+                    
+                    participantIndex = endIndex;
                 }
             }
-
-            if (!placed) {
-                bins.add(new List<DAPV1AttendanceRequest.AppointmentPayload>{ appt });
-                binCounts.add(participantCount);
-            }
-            
-            processedAppointmentIds.add(appt.serviceAppointmentId);
         }
-        return bins;
+        return jobs;
+    }
+
+    /**
+     * (NEW) Helper method to set the 202 Accepted response, following existing framework patterns.
+     */
+    private static void updateAcceptedResponse(RestResponse restResponse, Object response) {        
+        restResponse.statusCode = 202; // HTTP 202 Accepted for async processing
+        restResponse.addHeader('Content-Type', 'application/json');
+        restResponse.responseBody = Blob.valueOf(JSON.serialize(response));
     }
 }
 
 
-// --- Helper class for the JSON Request Body ---
+// --- Helper classes for the JSON Request/Response Bodies ---
 public with sharing class DAPV1AttendanceRequest {
     public List<AppointmentPayload> appointments;
     public class AppointmentPayload {
@@ -95,11 +122,29 @@ public with sharing class DAPV1AttendanceRequest {
         public String lastName;
         public String email;
         public String phone;
-        public String zipCode;
         public String status;
         public String customerIdtype;
     }
 }
+
+/**
+ * (NEW) Dedicated response class for a clean, type-safe API contract.
+ */
+public with sharing class DAPV1AttendanceResponse {
+    public String status;
+    public String runId;
+    public Integer jobsEnqueued;
+}
+
+
+// --- STUB for the Master Tracking Record ---
+// This custom object will need to be created in Salesforce for this code to deploy.
+global class DAP_Bulk_Attendance_Run__c extends SObject {
+    public String Status__c;
+    public Decimal Total_Participants_Submitted__c;
+}
+
+
 
 /**
  * [TEST VERSION - "All-in-One" Model]
