@@ -45,7 +45,7 @@ global with sharing class DAPV1AttendanceResource {
                 System.enqueueJob(job);
             }
 
-            // (FIXED) Create a dedicated response object and use a helper method for consistency.
+            // Create a dedicated response object and use a helper method for consistency.
             DAPV1AttendanceResponse responsePayload = new DAPV1AttendanceResponse();
             responsePayload.status = 'Request accepted for processing.';
             responsePayload.runId = masterRun.Id;
@@ -103,7 +103,7 @@ global with sharing class DAPV1AttendanceResource {
      */
     private static void updateAcceptedResponse(RestResponse restResponse, Object response) {        
         restResponse.statusCode = 202; // HTTP 202 Accepted for async processing
-        restResponse.addHeader('Content-Type', 'application/json');
+        restResponse.addHeader(DAPV1SchedulerConstants.HTTP_HEADER_CONTENT_TYPE_NAME, DAPV1SchedulerConstants.HTTP_HEADER_CONTENT_TYPE_VALUE);
         restResponse.responseBody = Blob.valueOf(JSON.serialize(response));
     }
 }
