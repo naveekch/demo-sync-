@@ -1,18 +1,13 @@
 @RestResource(urlMapping='/scheduler/v1/targeted-appointments/participants')
 global with sharing class DAPV1AttendanceResource {
 
-    // Max participants per queue job
     @TestVisible private static final Integer BIN_CAPACITY = 100;
-
-    // Contract limit from client per API call (hard cap)
     @TestVisible private static final Integer MAX_PARTICIPANTS_PER_REQUEST = 2000;
 
     @HttpPost
     global static void processAttendance() {
         RestRequest req = RestContext.request;
         RestResponse res = RestContext.response;
-
-        // Optional correlation/request id (reuse your 1:1 flow header name)
         String fsReqId = req.headers.get(DAPV1SchedulerConstants.HTTP_HEADER_FSREQ_ID);
 
         try {
@@ -47,21 +42,18 @@ global with sharing class DAPV1AttendanceResource {
                 );
             }
 
-            // 4) (Optional) create a run record here in prod; UAT uses a placeholder
-            Id masterRunId = 'a00000000000000AAA'; // TODO: replace with real tracker in prod
+            // 4) (UAT placeholder; replace with real tracker in prod)
+            Id masterRunId = 'a00000000000000AAA';
 
             // 5) Global pack → fewest bins, track per-bin finalizeSaIds
             List<DAPV1ParticipantBinPayload> bins = packIntoBins(body.appointments);
 
-            // 6) Enqueue one job per bin and (optionally) gather jobIds
-            List<String> jobIds = new List<String>();
+            // 6) Enqueue one job per bin
             for (DAPV1ParticipantBinPayload bin : bins) {
-                // NOTE: The DAPV1ParticipantBinProcessorQueueable needs to be updated to accept these args
-                 String jobId = System.enqueueJob(new DAPV1ParticipantBinProcessorQueueable(bin, masterRunId, fsReqId));
-                 jobIds.add(jobId);
+                System.enqueueJob(new DAPV1ParticipantBinProcessorQueueable(bin, masterRunId, fsReqId));
             }
 
-            // 7) Respond 202 Accepted
+            // 7) Respond 202 Accepted (master run only, per your latest ask)
             DAPV1AttendanceResponse payload = new DAPV1AttendanceResponse();
             payload.status = 'Request accepted for processing.';
             payload.runId = masterRunId;
@@ -82,48 +74,55 @@ global with sharing class DAPV1AttendanceResource {
     private static List<DAPV1ParticipantBinPayload> packIntoBins(List<DAPV1AttendanceRequest.AppointmentPayload> allAppointments) {
         List<DAPV1ParticipantBinPayload> bins = new List<DAPV1ParticipantBinPayload>();
 
-        // Remaining participants per SA (keyed by Id)
-        Map<Id, List<DAPV1AttendanceRequest.ParticipantPayload>> remaining = new Map<Id, List<DAPV1AttendanceRequest.ParticipantPayload>>();
+        // Remaining participants per SA (keyed by Id-as-String first)
+        Map<String, List<DAPV1AttendanceRequest.ParticipantPayload>> remainingBySa = new Map<String, List<DAPV1AttendanceRequest.ParticipantPayload>>();
         for (DAPV1AttendanceRequest.AppointmentPayload appt : allAppointments) {
-            if (appt == null || appt.participants == null || appt.participants.isEmpty()) continue;
-            if (!Id.isValid(appt.serviceAppointmentId)) continue;
-            Id saId = (Id) appt.serviceAppointmentId;
-            remaining.put(saId, new List<DAPV1AttendanceRequest.ParticipantPayload>(appt.participants));
+            if (appt == null || String.isBlank(appt.serviceAppointmentId)) continue;
+            if (appt.participants == null || appt.participants.isEmpty()) continue;
+            remainingBySa.put(appt.serviceAppointmentId, new List<DAPV1AttendanceRequest.ParticipantPayload>(appt.participants));
         }
-        if (remaining.isEmpty()) return bins;
+        if (remainingBySa.isEmpty()) return bins;
 
-        // Deterministic SA order
-        List<Id> saIds = new List<Id>(remaining.keySet());
-        saIds.sort();
+        // Deterministic ordering of SA Ids
+        List<String> saIdStrings = new List<String>(remainingBySa.keySet());
+        saIdStrings.sort();
 
         DAPV1ParticipantBinPayload currentBin = new DAPV1ParticipantBinPayload();
-        Integer used = 0;
+        Integer usedInBin = 0;
 
-        for (Id saId : saIds) {
-            List<DAPV1AttendanceRequest.ParticipantPayload> list = remaining.get(saId);
-            Integer from = 0;
-            Integer size = list.size();
+        for (String saIdStr : saIdStrings) {
+            // Safely coerce to Id; skip invalid Id strings
+            Id saId;
+            try { saId = (Id) saIdStr; }
+            catch (Exception ex) { continue; }
 
-            while (from < size) {
-                Integer space = BIN_CAPACITY - used;
-                if (space == 0 && used > 0) {
+            List<DAPV1AttendanceRequest.ParticipantPayload> parts = remainingBySa.get(saIdStr);
+            Integer startIdx = 0;
+            Integer totalForSa = parts.size();
+
+            while (startIdx < totalForSa) {
+                Integer spaceLeft = BIN_CAPACITY - usedInBin;
+
+                if (spaceLeft == 0 && usedInBin > 0) {
                     bins.add(currentBin);
                     currentBin = new DAPV1ParticipantBinPayload();
-                    used = 0;
-                    space = BIN_CAPACITY;
+                    usedInBin = 0;
+                    spaceLeft = BIN_CAPACITY;
                 }
 
-                Integer to = Math.min(from + space, size);
+                Integer endIdx = Math.min(startIdx + spaceLeft, totalForSa);
 
-                // slice by index
+                // Slice by index
                 List<DAPV1AttendanceRequest.ParticipantPayload> slice = new List<DAPV1AttendanceRequest.ParticipantPayload>();
-                for (Integer i = from; i < to; i++) slice.add(list[i]);
+                for (Integer i = startIdx; i < endIdx; i++) {
+                    slice.add(parts[i]);
+                }
 
                 currentBin.slices.add(new DAPV1ParticipantBinPayload.ApptSlice(saId, slice));
-                used += (to - from);
-                from = to;
+                usedInBin += (endIdx - startIdx);
+                startIdx = endIdx;
 
-                if (from >= size) {
+                if (startIdx >= totalForSa) {
                     // This bin finishes this SA
                     currentBin.finalizeSaIds.add(saId);
                 }
@@ -134,11 +133,12 @@ global with sharing class DAPV1AttendanceResource {
         return bins;
     }
 
+    // Helper to return a 202 JSON response
     private static void updateAcceptedResponse(RestResponse restResponse, Object response) {
         restResponse.statusCode = 202;
         restResponse.addHeader(
             DAPV1SchedulerConstants.HTTP_HEADER_CONTENT_TYPE_NAME,
-            DAPV1SchedulerConstants.HTTP_HEADER_CONTENT_TYPE_VALUE // ensure this is "application/json; charset=UTF-8"
+            DAPV1SchedulerConstants.HTTP_HEADER_CONTENT_TYPE_VALUE
         );
         restResponse.responseBody = Blob.valueOf(JSON.serialize(response));
     }
@@ -149,9 +149,8 @@ global with sharing class DAPV1AttendanceResource {
  * ------------------------- */
 public with sharing class DAPV1AttendanceRequest {
     public List<AppointmentPayload> appointments;
-
     public class AppointmentPayload {
-        public String serviceAppointmentId; // must be a valid Id
+        public String serviceAppointmentId;
         public List<ParticipantPayload> participants;
     }
     public class ParticipantPayload {
@@ -177,11 +176,9 @@ public with sharing class DAPV1ParticipantBinPayload {
     public List<ApptSlice> slices = new List<ApptSlice>();
     public Set<Id> finalizeSaIds = new Set<Id>();
 
-    // Nested type
     public class ApptSlice {
         public Id serviceAppointmentId;
         public List<DAPV1AttendanceRequest.ParticipantPayload> participants;
-
         public ApptSlice(Id saId, List<DAPV1AttendanceRequest.ParticipantPayload> parts) {
             serviceAppointmentId = saId;
             participants = parts;
@@ -189,13 +186,12 @@ public with sharing class DAPV1ParticipantBinPayload {
     }
 }
 
-// --- STUB for the Master Tracking Record ---
-// This custom object will need to be created in Salesforce for this code to deploy.
-global class DAP_Bulk_Attendance_Run__c extends SObject {
-    public String Status__c;
-    public Decimal Total_Participants_Submitted__c;
-}
-
+/**
+ * (UAT-READY • Global Bin Packing)
+ * This is a "dumb worker" Queueable job. Its only job is to receive a
+ * pre-processed bin of work from the API and hand it off to the synchronous
+ * handler to be processed in one single transaction.
+ */
 public with sharing class DAPV1ParticipantBinProcessorQueueable implements Queueable {
 
     private final DAPV1ParticipantBinPayload bin;
