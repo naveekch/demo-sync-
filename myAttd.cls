@@ -198,30 +198,26 @@ global class DAP_Bulk_Attendance_Run__c extends SObject {
 
 public with sharing class DAPV1ParticipantBinProcessorQueueable implements Queueable {
 
-    private final List<DAPV1AttendanceRequest.AppointmentPayload> appointmentsInBin;
-    private final Boolean isFinalBin;
+    private final DAPV1ParticipantBinPayload bin;
     private final Id runId;
     private final String fsReqId;
 
-    public DAPV1ParticipantBinProcessorQueueable(List<DAPV1AttendanceRequest.AppointmentPayload> appointmentsInBin, Boolean isFinalBin, Id runId, String fsReqId) {
-        this.appointmentsInBin = appointmentsInBin;
-        this.isFinalBin = isFinalBin;
+    public DAPV1ParticipantBinProcessorQueueable(DAPV1ParticipantBinPayload bin, Id runId, String fsReqId) {
+        this.bin = bin;
         this.runId = runId;
         this.fsReqId = fsReqId;
     }
 
     public void execute(QueueableContext context) {
-        // Use the centralized logging utility for consistent, traceable logs.
-        DAPV1SchedulerApiLoggingUtil.logInfo('[ParticipantBinProcessor] Started for Run ID: ' + runId + '. IsFinal=' + isFinalBin, fsReqId, DAPV1ParticipantBinProcessorQueueable.class);
-
+        DAPV1SchedulerApiLoggingUtil.logInfo('[ParticipantBinProcessor] Started for Run ID: ' + runId, fsReqId, DAPV1ParticipantBinProcessorQueueable.class);
         try {
             // This job's only responsibility is to call the handler to do the work.
             DAPV1ParticipantSyncHandler handler = new DAPV1ParticipantSyncHandler();
-            handler.processParticipantsInBin(this.appointmentsInBin, this.isFinalBin, this.runId, this.fsReqId);
+            handler.processBin(this.bin, this.runId, this.fsReqId);
         } catch (Exception e) {
-            DAPV1SchedulerApiLoggingUtil.logError('[ParticipantBinProcessor] Critical error for Run ID: ' + runId + '. Error: ' + e.getMessage() + ' Stacktrace: ' + e.getStackTraceString(), fsReqId, DAPV1ParticipantBinProcessorQueueable.class);
+            // If the whole transaction fails (e.g., CPU timeout), this is our last chance to log it.
+            DAPV1SchedulerApiLoggingUtil.logError('[ParticipantBinProcessor] Critical error for Run ID: ' + runId + '. Error: ' + e.getMessage(), fsReqId, DAPV1ParticipantBinProcessorQueueable.class);
         }
-
         DAPV1SchedulerApiLoggingUtil.logInfo('[ParticipantBinProcessor] Finished for Run ID: ' + runId, fsReqId, DAPV1ParticipantBinProcessorQueueable.class);
     }
 }
