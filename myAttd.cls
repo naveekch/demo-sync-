@@ -1,8 +1,8 @@
 /**
- * (UAT-READY VERSION)
- * This is the main entrypoint for the bulk attendance API. It uses a "bin packing"
- * algorithm that intentionally splits large appointments across multiple bins to test
- * concurrent parent record locking during UAT.
+ * (TEST VERSION - "Split Appointment" Model)
+ * This is the main entrypoint for the bulk attendance API.
+ * It uses a bin packing algorithm that INTENTIONALLY splits large appointments
+ * across multiple bins to test concurrent parent record locking.
  */
 @RestResource(urlMapping='/scheduler/v1/targeted-appointments/participants')
 global with sharing class DAPV1AttendanceResource {
@@ -14,6 +14,7 @@ global with sharing class DAPV1AttendanceResource {
     global static void processAttendance() {
         RestRequest req = RestContext.request;
         RestResponse res = RestContext.response;
+        // Get the request ID for logging, just like the 1:1 flow.
         String fsReqId = req.headers.get(DAPV1SchedulerConstants.HTTP_HEADER_FSREQ_ID);
         
         try {
@@ -21,7 +22,6 @@ global with sharing class DAPV1AttendanceResource {
                 req.requestBody.toString(), DAPV1AttendanceRequest.class
             );
 
-            // Use the centralized logging utility for validation errors.
             if (requestBody == null || requestBody.appointments == null || requestBody.appointments.isEmpty()) {
                 DAPV1SchedulerApiLoggingUtil.logAndThrowSchedulerApiException(
                     DAPV1SchedulerConstants.ERROR_CODE_BAD_REQUEST, 
@@ -39,7 +39,8 @@ global with sharing class DAPV1AttendanceResource {
             insert masterRun;
 
             // This binning logic now splits large appointments across multiple jobs.
-            List<DAPV1ParticipantBinProcessorQueueable> jobsToEnqueue = packIntoBinsAndCreateJobs(requestBody.appointments, masterRun.Id);
+            // (FIXED) Pass the fsReqId for traceable logging.
+            List<DAPV1ParticipantBinProcessorQueueable> jobsToEnqueue = packIntoBinsAndCreateJobs(requestBody.appointments, masterRun.Id, fsReqId);
 
             for (DAPV1ParticipantBinProcessorQueueable job : jobsToEnqueue) {
                 System.enqueueJob(job);
@@ -62,16 +63,16 @@ global with sharing class DAPV1AttendanceResource {
     /**
      * (TEST VERSION) This "bin packing" logic has been rewritten.
      * It now intentionally splits a single large appointment across multiple bins
-     * and passes the master runId to each job.
+     * and passes the master runId and fsReqId to each job.
      */
-    private static List<DAPV1ParticipantBinProcessorQueueable> packIntoBinsAndCreateJobs(List<DAPV1AttendanceRequest.AppointmentPayload> allAppointments, Id runId) {
+    private static List<DAPV1ParticipantBinProcessorQueueable> packIntoBinsAndCreateJobs(List<DAPV1AttendanceRequest.AppointmentPayload> allAppointments, Id runId, String fsReqId) {
         List<DAPV1ParticipantBinProcessorQueueable> jobs = new List<DAPV1ParticipantBinProcessorQueueable>();
         
         for (DAPV1AttendanceRequest.AppointmentPayload appt : allAppointments) {
             if (appt == null || String.isBlank(appt.serviceAppointmentId) || appt.participants == null || appt.participants.isEmpty()) continue;
             
             if (appt.participants.size() <= BIN_CAPACITY) {
-                jobs.add(new DAPV1ParticipantBinProcessorQueueable(new List<DAPV1AttendanceRequest.AppointmentPayload>{appt}, true, runId));
+                jobs.add(new DAPV1ParticipantBinProcessorQueueable(new List<DAPV1AttendanceRequest.AppointmentPayload>{appt}, true, runId, fsReqId));
             } 
             else {
                 Integer participantIndex = 0;
@@ -89,7 +90,7 @@ global with sharing class DAPV1AttendanceResource {
                     
                     Boolean isFinal = (endIndex >= appt.participants.size());
                     
-                    jobs.add(new DAPV1ParticipantBinProcessorQueueable(new List<DAPV1AttendanceRequest.AppointmentPayload>{chunkedAppt}, isFinal, runId));
+                    jobs.add(new DAPV1ParticipantBinProcessorQueueable(new List<DAPV1AttendanceRequest.AppointmentPayload>{chunkedAppt}, isFinal, runId, fsReqId));
                     
                     participantIndex = endIndex;
                 }
@@ -144,37 +145,33 @@ global class DAP_Bulk_Attendance_Run__c extends SObject {
     public Decimal Total_Participants_Submitted__c;
 }
 
-
-
-/**
- * [TEST VERSION - "All-in-One" Model]
- * This is the "marathon runner" version of our processor. Its only job is to kick off the
- * handler to process the ENTIRE bin of appointments in one single, large transaction.
- *
- * This is simpler than chaining, but it's risky because a big, complex bin could hit the
- * 60-second CPU limit in a busy production org. We're using this to test the limits.
- */
 public with sharing class DAPV1ParticipantBinProcessorQueueable implements Queueable {
 
     private final List<DAPV1AttendanceRequest.AppointmentPayload> appointmentsInBin;
+    private final Boolean isFinalBin;
+    private final Id runId;
+    private final String fsReqId;
 
-    public DAPV1ParticipantBinProcessorQueueable(List<DAPV1AttendanceRequest.AppointmentPayload> appointmentsInBin) {
+    public DAPV1ParticipantBinProcessorQueueable(List<DAPV1AttendanceRequest.AppointmentPayload> appointmentsInBin, Boolean isFinalBin, Id runId, String fsReqId) {
         this.appointmentsInBin = appointmentsInBin;
+        this.isFinalBin = isFinalBin;
+        this.runId = runId;
+        this.fsReqId = fsReqId;
     }
 
     public void execute(QueueableContext context) {
-        System.debug(LoggingLevel.INFO, '[AllInOneProcessor] Started. Processing ' + appointmentsInBin.size() + ' appointments in a single transaction.');
-        
+        // Use the centralized logging utility for consistent, traceable logs.
+        DAPV1SchedulerApiLoggingUtil.logInfo('[ParticipantBinProcessor] Started for Run ID: ' + runId + '. IsFinal=' + isFinalBin, fsReqId, DAPV1ParticipantBinProcessorQueueable.class);
+
         try {
             // This job's only responsibility is to call the handler to do the work.
             DAPV1ParticipantSyncHandler handler = new DAPV1ParticipantSyncHandler();
-            handler.processParticipantsInBin(this.appointmentsInBin);
+            handler.processParticipantsInBin(this.appointmentsInBin, this.isFinalBin, this.runId, this.fsReqId);
         } catch (Exception e) {
-            // If the whole transaction fails (e.g., CPU timeout), this is our last chance to log it.
-            System.debug(LoggingLevel.ERROR, '[AllInOneProcessor] Critical error during processing: ' + e.getMessage() + ' Stacktrace: ' + e.getStackTraceString());
+            DAPV1SchedulerApiLoggingUtil.logError('[ParticipantBinProcessor] Critical error for Run ID: ' + runId + '. Error: ' + e.getMessage() + ' Stacktrace: ' + e.getStackTraceString(), fsReqId, DAPV1ParticipantBinProcessorQueueable.class);
         }
 
-        System.debug(LoggingLevel.INFO, '[AllInOneProcessor] Finished.');
+        DAPV1SchedulerApiLoggingUtil.logInfo('[ParticipantBinProcessor] Finished for Run ID: ' + runId, fsReqId, DAPV1ParticipantBinProcessorQueueable.class);
     }
 }
 
