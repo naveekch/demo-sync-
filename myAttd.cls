@@ -219,125 +219,210 @@ public with sharing class DAPV1ParticipantBinProcessorQueueable implements Queue
 }
 
 /**
- * [TEST VERSION - "All-in-One" Model]
- * This is the synchronous "core engine" for our test. It's designed to be a "power worker"
- * that gathers all data from an entire bin, does all the lookups, and then performs
- * all the database operations in a few, large bulk DML statements.
+ * (UAT-READY • Global Bin Packing)
+ * This is the "core engine". It's a simple, synchronous utility that does the
+ * actual business logic for an entire bin of participants.
  */
 public with sharing class DAPV1ParticipantSyncHandler {
     
-    // We'll call the existing accessor classes from the 1:1 flow.
     @TestVisible private DAPV1SObjSrvcApptDmlAccessor apptAccessor = new DAPV1SObjSrvcApptDmlAccessor();
-    @TestVisible private DAPV1SObjEvntAudnceDmlAccessor eventAudienceAccessor = new DAPV1SObjEvntAudnceDmlAccessor();
+    @TestVisible private AccountsService accountsService = new AccountsService();
 
-    public void processParticipantsInBin(List<DAPV1AttendanceRequest.AppointmentPayload> bin) {
-        // We'll create master lists to hold all the records we're going to process.
-        List<DAP_Event_Participant__c> allParticipantsToInsert = new List<DAP_Event_Participant__c>();
-        List<DAP_Event_Participant__c> allParticipantsToUpdate = new List<DAP_Event_Participant__c>();
-        Set<String> allServiceAppointmentIds = new Set<String>();
-        Map<String, List<DAPV1AttendanceRequest.ParticipantPayload>> participantsByAppointment = new Map<String, List<DAPV1AttendanceRequest.ParticipantPayload>>();
+    public void processBin(DAPV1ParticipantBinPayload bin, Id runId, String fsReqId) {
+        // --- Step 1: Gather participants per SA (Id-keyed) ---
+        Map<Id, List<DAPV1AttendanceRequest.ParticipantPayload>> bySa = new Map<Id, List<DAPV1AttendanceRequest.ParticipantPayload>>();
+        for (DAPV1ParticipantBinPayload.ApptSlice slice : bin.slices) {
+            if (slice == null || slice.serviceAppointmentId == null || slice.participants == null || slice.participants.isEmpty()) continue;
+            if (!bySa.containsKey(slice.serviceAppointmentId)) {
+                bySa.put(slice.serviceAppointmentId, new List<DAPV1AttendanceRequest.ParticipantPayload>());
+            }
+            bySa.get(slice.serviceAppointmentId).addAll(slice.participants);
+        }
+        if (bySa.isEmpty()) return;
 
-        // --- Step 1: First, just gather and organize all the data from the bin ---
-        for (DAPV1AttendanceRequest.AppointmentPayload appt : bin) {
-            if (appt == null || String.isBlank(appt.serviceAppointmentId) || appt.participants == null || appt.participants.isEmpty()) continue;
-            
-            allServiceAppointmentIds.add(appt.serviceAppointmentId);
-            participantsByAppointment.put(appt.serviceAppointmentId, appt.participants);
+        // --- Step 2: Validate SAs in bulk ---
+        Set<Id> validSaIds = validateServiceAppointments(bySa.keySet(), fsReqId);
+        if (validSaIds.isEmpty()) {
+            DAPV1SchedulerApiLoggingUtil.logError('No valid Service Appointments found in this bin.', fsReqId, DAPV1ParticipantSyncHandler.class);
+            return;
         }
 
-        if (allServiceAppointmentIds.isEmpty()) return;
+        // --- Step 3: Dedup query (existing EPs by SA+ExternalId) ---
+        Map<String, DAP_Event_Participant__c> existing = getExistingParticipants(bySa);
 
-        // --- Step 2: Now, do one big database query to find all existing participants ---
-        Map<String, DAP_Event_Participant__c> existingParticipantsMap = getExistingParticipants(participantsByAppointment);
+        // --- Step 4: Triage into updates vs inserts ---
+        List<DAP_Event_Participant__c> toUpdate = new List<DAP_Event_Participant__c>();
+        List<DAPV1AttendanceRequest.ParticipantPayload> newCandidates = new List<DAPV1AttendanceRequest.ParticipantPayload>();
+        // Also build a reverse lookup: payload -> SA Id
+        Map<DAPV1AttendanceRequest.ParticipantPayload, Id> payloadToSa = new Map<DAPV1AttendanceRequest.ParticipantPayload, Id>();
 
-        // --- Step 3: Loop through the data and prepare the records for DML ---
-        for (String saId : participantsByAppointment.keySet()) {
-            for (DAPV1AttendanceRequest.ParticipantPayload p : participantsByAppointment.get(saId)) {
-                // We create a "composite key" to uniquely identify a registration
-                // for one person at one specific event.
-                String compositeKey = saId + '-' + p.externalId;
-                String normalizedStatus = normalizeStatus(p.status);
-
-                if (existingParticipantsMap.containsKey(compositeKey)) {
-                    // If we found a match, we update the existing record.
-                    DAP_Event_Participant__c ep = existingParticipantsMap.get(compositeKey);
-                    ep.Status__c = normalizedStatus;
-                    allParticipantsToUpdate.add(ep);
+        for (Id saId : bySa.keySet()) {
+            if (!validSaIds.contains(saId)) continue;
+            for (DAPV1AttendanceRequest.ParticipantPayload p : bySa.get(saId)) {
+                payloadToSa.put(p, saId);
+                String k = (String)saId + '-' + p.externalId;
+                if (existing.containsKey(k)) {
+                    DAP_Event_Participant__c ep = existing.get(k);
+                    ep.Status__c = normalizeStatus(p.status);
+                    toUpdate.add(ep);
                 } else {
-                    // If no match, we create a new record.
-                    DAP_Event_Participant__c ep = new DAP_Event_Participant__c(
-                        Service_Appointment__c = saId,
-                        ExternalId__c = p.externalId,
-                        Notification_Email__c = p.email,
-                        Status__c = normalizedStatus,
-                        Meeting_Method__c = 'Virtual'
-                    );
-                    allParticipantsToInsert.add(ep);
+                    newCandidates.add(p);
                 }
             }
         }
-        
-        // --- Step 4: Perform all database operations for the entire bin at once ---
-        DAPV1ParticipantDmlAccessor dmlAccessor = new DAPV1ParticipantDmlAccessor();
-        if (!allParticipantsToInsert.isEmpty()) {
-            dmlAccessor.insertParticipants(allParticipantsToInsert);
-        }
-        if (!allParticipantsToUpdate.isEmpty()) {
-            dmlAccessor.updateParticipants(allParticipantsToUpdate);
+
+        // --- Step 5: Insert path (resolve Account by MID; else create Lead) ---
+        List<DAP_Event_Participant__c> toInsert = new List<DAP_Event_Participant__c>();
+        if (!newCandidates.isEmpty()) {
+            // Split by MID vs no-MID
+            List<DAPV1AttendanceRequest.ParticipantPayload> withMid = new List<DAPV1AttendanceRequest.ParticipantPayload>();
+            List<DAPV1AttendanceRequest.ParticipantPayload> noMid   = new List<DAPV1AttendanceRequest.ParticipantPayload>();
+            for (DAPV1AttendanceRequest.ParticipantPayload p : newCandidates) {
+                if ('mid'.equalsIgnoreCase(p.customerIdtype) && String.isNotBlank(p.id)) withMid.add(p);
+                else noMid.add(p);
+            }
+
+            Map<String, Id> customerIdToAccountId = getMatchingAccounts(withMid);
+            Map<String, Id> externalIdToLeadId    = createNewLeads(noMid, fsReqId);
+
+            // Assemble EPs
+            for (DAPV1AttendanceRequest.ParticipantPayload p : newCandidates) {
+                Id saId = payloadToSa.get(p);
+                if (saId == null) continue;
+                DAP_Event_Participant__c ep = new DAP_Event_Participant__c(
+                    Service_Appointment__c = saId,
+                    ExternalId__c          = p.externalId,
+                    FirstName__c           = p.firstName,
+                    LastName__c            = p.lastName,
+                    Notification_Email__c  = p.email,
+                    Notification_Phone__c  = p.phone,
+                    Status__c              = normalizeStatus(p.status),
+                    Meeting_Method__c      = 'Virtual'
+                );
+                if (String.isNotBlank(p.id) && customerIdToAccountId.containsKey(p.id)) {
+                    ep.Account__c = customerIdToAccountId.get(p.id);
+                } else if (externalIdToLeadId.containsKey(p.externalId)) {
+                    ep.Lead__c = externalIdToLeadId.get(p.externalId);
+                }
+                toInsert.add(ep);
+            }
         }
 
-        // --- Step 5: Finally, update all the parent Service Appointment statuses ---
-        finalizeAppointmentStatuses(allServiceAppointmentIds);
+        // --- Step 6: Bulk DML ---
+        if (!toInsert.isEmpty())  DAPV1ParticipantDmlAccessor.insertParticipants(toInsert);
+        if (!toUpdate.isEmpty())  DAPV1ParticipantDmlAccessor.updateParticipants(toUpdate);
+
+        // --- Step 7: Finalize SA statuses for those completed in this bin ---
+        if (bin.finalizeSaIds != null && !bin.finalizeSaIds.isEmpty()) {
+            Set<Id> finalizeValid = new Set<Id>();
+            for (Id f : bin.finalizeSaIds) if (validSaIds.contains(f)) finalizeValid.add(f);
+            if (!finalizeValid.isEmpty()) finalizeAppointmentStatuses(finalizeValid);
+        }
     }
-    
-    // This method updates all the parent statuses in one bulk DML statement for efficiency.
-    private void finalizeAppointmentStatuses(Set<String> serviceAppointmentIds) {
-        // The "FOR UPDATE" clause is a critical safety feature. It locks these specific
-        // rows in the database, which prevents race conditions if another API call
-        // tries to update the same appointments at the exact same time.
-        List<ServiceAppointment> appointmentsToUpdate = [
-            SELECT Id, Status FROM ServiceAppointment WHERE Id IN :serviceAppointmentIds FOR UPDATE
+
+    /* ===== Helpers ===== */
+
+    private Set<Id> validateServiceAppointments(Set<Id> saIds, String fsReqId) {
+        Set<Id> valid = new Set<Id>();
+        if (saIds == null || saIds.isEmpty()) return valid;
+        Map<Id, ServiceAppointment> found = new Map<Id, ServiceAppointment>(
+            [SELECT Id FROM ServiceAppointment WHERE Id IN :saIds]
+        );
+        for (Id saId : saIds) {
+            if (found.containsKey(saId)) valid.add(saId);
+            else DAPV1SchedulerApiLoggingUtil.logError(
+                'Invalid Service Appointment ID provided in payload: ' + saId, fsReqId, DAPV1ParticipantSyncHandler.class);
+        }
+        return valid;
+    }
+
+    private Map<String, DAP_Event_Participant__c> getExistingParticipants(
+        Map<Id, List<DAPV1AttendanceRequest.ParticipantPayload>> bySa
+    ){
+        Set<String> extIds = new Set<String>();
+        for (Id saId : bySa.keySet()) {
+            for (DAPV1AttendanceRequest.ParticipantPayload p : bySa.get(saId)) {
+                if (String.isNotBlank(p.externalId)) extIds.add(p.externalId);
+            }
+        }
+        Map<String, DAP_Event_Participant__c> out = new Map<String, DAP_Event_Participant__c>();
+        if (extIds.isEmpty()) return out;
+
+        for (DAP_Event_Participant__c ep : [
+            SELECT Id, ExternalId__c, Status__c, Service_Appointment__c
+            FROM DAP_Event_Participant__c
+            WHERE Service_Appointment__c IN :bySa.keySet()
+              AND ExternalId__c IN :extIds
+        ]) {
+            out.put((String)ep.Service_Appointment__c + '-' + ep.ExternalId__c, ep);
+        }
+        return out;
+    }
+
+    private void finalizeAppointmentStatuses(Set<Id> saIds) {
+        List<ServiceAppointment> toUpd = [
+            SELECT Id, Status FROM ServiceAppointment WHERE Id IN :saIds FOR UPDATE
         ];
-        for (ServiceAppointment sa : appointmentsToUpdate) {
-            // We only update the status if it's not already correct, to avoid
-            // firing unnecessary triggers and automation.
+        for (ServiceAppointment sa : toUpd) {
             if (sa.Status != 'Published with Registrations') {
                 sa.Status = 'Published with Registrations';
             }
         }
-        if(!appointmentsToUpdate.isEmpty()){
-             this.apptAccessor.updateServiceAppointments(appointmentsToUpdate);
-        }
+        if (!toUpd.isEmpty()) apptAccessor.updateServiceAppointments(toUpd);
     }
 
-    // This is our main deduplication query. It's bulkified to run only once for the entire bin.
-    private Map<String, DAP_Event_Participant__c> getExistingParticipants(Map<String, List<DAPV1AttendanceRequest.ParticipantPayload>> participantsByAppointment) {
-        Set<String> externalIds = new Set<String>();
-        for (String saId : participantsByAppointment.keySet()) {
-            for (DAPV1AttendanceRequest.ParticipantPayload p : participantsByAppointment.get(saId)) {
-                if (String.isNotBlank(p.externalId)) {
-                    externalIds.add(p.externalId);
-                }
-            }
+    private Map<String, Id> getMatchingAccounts(List<DAPV1AttendanceRequest.ParticipantPayload> participants) {
+        if (participants == null || participants.isEmpty()) return new Map<String, Id>();
+        List<Customer> customers = new List<Customer>();
+        for (DAPV1AttendanceRequest.ParticipantPayload p : participants) {
+            Customer c = new Customer();
+            c.custType     = DAPV1SchedulerConstants.CUSTOMER; // "Customer"
+            c.custId       = p.id; // MID
+            c.firstName    = p.firstName;
+            c.lastName     = p.lastName;
+            c.primaryEmail = p.email;
+            customers.add(c);
         }
-        
-        Map<String, DAP_Event_Participant__c> results = new Map<String, DAP_Event_Participant__c>();
-        if(!externalIds.isEmpty()) {
-            // We find all potential matches based on the appointment IDs and external IDs.
-            for(DAP_Event_Participant__c ep : [
-                SELECT Id, ExternalId__c, Status__c, Service_Appointment__c
-                FROM DAP_Event_Participant__c
-                WHERE Service_Appointment__c IN :participantsByAppointment.keySet()
-                AND ExternalId__c IN :externalIds
-            ]) {
-                // We then put them into a Map using the composite key for a perfect match lookup.
-                results.put(ep.Service_Appointment__c + '-' + ep.ExternalId__c, ep);
-            }
-        }
-        return results;
+        Customers container = new Customers(customers);
+        return accountsService.resolveAccountIds(container); // returns Map<MID, AccountId>
     }
-    
-    // A simple helper to clean up incoming status values.
+
+    private Map<String, Id> createNewLeads(List<DAPV1AttendanceRequest.ParticipantPayload> participants, String fsReqId) {
+        Map<String, Id> extIdToLeadId = new Map<String, Id>();
+        if (participants == null || participants.isEmpty()) return extIdToLeadId;
+
+        List<Lead> leads = new List<Lead>();
+        Map<Integer, String> rowToExternalId = new Map<Integer, String>();
+
+        Integer idx = 0;
+        for (DAPV1AttendanceRequest.ParticipantPayload p : participants) {
+            Lead l = new Lead(
+                FirstName = p.firstName,
+                LastName  = p.lastName,
+                Email     = p.email,
+                Phone     = p.phone,
+            );
+            leads.add(l);
+            rowToExternalId.put(idx++, p.externalId);
+        }
+
+        Database.SaveResult[] sr = Database.insert(leads, false);
+        for (Integer i = 0; i < sr.size(); i++) {
+            if (sr[i].isSuccess()) {
+                String ext = rowToExternalId.get(i);
+                if (String.isNotBlank(ext)) extIdToLeadId.put(ext, sr[i].getId());
+            } else {
+                Database.Error err = sr[i].getErrors().isEmpty() ? null : sr[i].getErrors()[0];
+                DAPV1SchedulerApiLoggingUtil.logError(
+                    'Failed to create Lead for externalId: ' + rowToExternalId.get(i) + 
+                    (err != null ? ('. Error: ' + err.getMessage()) : ''),
+                    fsReqId, DAPV1ParticipantSyncHandler.class
+                );
+            }
+        }
+        return extIdToLeadId;
+    }
+
     private String normalizeStatus(String status) { 
         if (String.isBlank(status)) return 'Registered';
         String s = status.toLowerCase().trim();
@@ -346,6 +431,7 @@ public with sharing class DAPV1ParticipantSyncHandler {
         return 'Registered';
     }
 }
+
 
 // DML Accessor for Participant records
 public with sharing class DAPV1ParticipantDmlAccessor {
