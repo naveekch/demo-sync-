@@ -154,6 +154,7 @@ public with sharing class DAPV1AttendanceRequest {
         public List<ParticipantPayload> participants;
     }
     public class ParticipantPayload {
+        public String id;
         public String externalId;
         public String firstName;
         public String lastName;
