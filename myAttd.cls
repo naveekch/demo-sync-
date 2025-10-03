@@ -433,48 +433,45 @@ public with sharing class DAPV1ParticipantSyncHandler {
 }
 
 
-// DML Accessor for Participant records
 public with sharing class DAPV1ParticipantDmlAccessor {
-    public void insertParticipants(List<DAP_Event_Participant__c> participants) {
+
+    public static void insertParticipants(List<DAP_Event_Participant__c> participants) {
+        if (participants == null || participants.isEmpty()) return;
         try {
-            Database.SaveResult[] saveResults = Database.insert(participants, false);
-            logErrors(saveResults, participants);
+            Database.SaveResult[] sr = Database.insert(participants, /* allOrNone */ false);
+            logErrors(sr, participants);
         } catch (Exception e) {
-             System.debug(LoggingLevel.ERROR, 'Unexpected error during participant insert: ' + e.getMessage());
+            System.debug(LoggingLevel.ERROR,
+                'Unexpected error during participant insert: ' + e.getMessage());
         }
     }
-    public void updateParticipants(List<DAP_Event_Participant__c> participants) {
+
+    public static void updateParticipants(List<DAP_Event_Participant__c> participants) {
+        if (participants == null || participants.isEmpty()) return;
         try {
-            Database.SaveResult[] saveResults = Database.update(participants, false);
-            logErrors(saveResults, participants);
+            Database.SaveResult[] sr = Database.update(participants, /* allOrNone */ false);
+            logErrors(sr, participants);
         } catch (Exception e) {
-             System.debug(LoggingLevel.ERROR, 'Unexpected error during participant update: ' + e.getMessage());
+            System.debug(LoggingLevel.ERROR,
+                'Unexpected error during participant update: ' + e.getMessage());
         }
     }
-    private void logErrors(Database.SaveResult[] results, List<DAP_Event_Participant__c> records) {
+
+    private static void logErrors(Database.SaveResult[] results,
+                                  List<DAP_Event_Participant__c> records) {
+        if (results == null) return;
         for (Integer i = 0; i < results.size(); i++) {
             if (!results[i].isSuccess()) {
-                Database.Error error = results[i].getErrors()[0];
-                DAP_Event_Participant__c failedRecord = records[i];
-                System.debug(LoggingLevel.ERROR, 'Failed to process participant record. ExternalId: ' + failedRecord.ExternalId__c + '. Error: ' + error.getStatusCode() + ' - ' + error.getMessage());
+                Database.Error err = results[i].getErrors().isEmpty()
+                    ? null : results[i].getErrors()[0];
+                DAP_Event_Participant__c rec = (i < records.size()) ? records[i] : null;
+                System.debug(LoggingLevel.ERROR,
+                    'Failed to process participant. ' +
+                    'ExternalId=' + (rec != null ? rec.ExternalId__c : 'UNKNOWN') +
+                    ' StatusCode=' + (err != null ? String.valueOf(err.getStatusCode()) : 'n/a') +
+                    ' Message=' + (err != null ? err.getMessage() : 'n/a'));
             }
         }
     }
-}
-
-// --- DEPENDENCY CLASS (Full implementation for methods used in this POC) ---
-// This class contains the reusable methods from the 1:1 flow that our new code will call.
-public with sharing class DAPV1SObjSrvcApptDmlAccessor {
-    // A bulk-safe method to update a list of Service Appointments
-    public void updateServiceAppointments(List<ServiceAppointment> appointments) {
-        update appointments;
-    }
-    
-    // A method to update a single Service Appointment's status
-    public void updateTrgtSrvcApptStatus(SObject s, String status) { 
-        ServiceAppointment sa = (ServiceAppointment)s;
-        sa.Status = status;
-        update sa; 
-    } 
 }
 
