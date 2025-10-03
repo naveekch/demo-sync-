@@ -260,7 +260,7 @@ public with sharing class DAPV1ParticipantSyncHandler {
             if (!validSaIds.contains(saId)) continue;
             for (DAPV1AttendanceRequest.ParticipantPayload p : bySa.get(saId)) {
                 payloadToSa.put(p, saId);
-                String k = (String)saId + '-' + p.externalId;
+                String k = String.valueOf(saId) + '-' + p.externalId;
                 if (existing.containsKey(k)) {
                     DAP_Event_Participant__c ep = existing.get(k);
                     ep.Status__c = normalizeStatus(p.status);
