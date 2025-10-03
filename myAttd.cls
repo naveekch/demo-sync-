@@ -354,7 +354,7 @@ public with sharing class DAPV1ParticipantSyncHandler {
             WHERE Service_Appointment__c IN :bySa.keySet()
               AND ExternalId__c IN :extIds
         ]) {
-            out.put((String)ep.Service_Appointment__c + '-' + ep.ExternalId__c, ep);
+            out.put(String.valueOf(ep.Service_Appointment__c) + '-' + ep.ExternalId__c, ep);
         }
         return out;
     }
