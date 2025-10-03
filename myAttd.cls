@@ -219,11 +219,6 @@ public with sharing class DAPV1ParticipantBinProcessorQueueable implements Queue
     }
 }
 
-/**
- * (UAT-READY • Global Bin Packing)
- * This is the "core engine". It's a simple, synchronous utility that does the
- * actual business logic for an entire bin of participants.
- */
 public with sharing class DAPV1ParticipantSyncHandler {
     
     @TestVisible private DAPV1SObjSrvcApptDmlAccessor apptAccessor = new DAPV1SObjSrvcApptDmlAccessor();
@@ -293,8 +288,8 @@ public with sharing class DAPV1ParticipantSyncHandler {
                 DAP_Event_Participant__c ep = new DAP_Event_Participant__c(
                     Service_Appointment__c = saId,
                     ExternalId__c          = p.externalId,
-                    FirstName__c           = p.firstName,
-                    LastName__c            = p.lastName,
+                    First_Name__c           = p.firstName,
+                    Last_Name__c            = p.lastName,
                     Notification_Email__c  = p.email,
                     Notification_Phone__c  = p.phone,
                     Status__c              = normalizeStatus(p.status),
@@ -369,7 +364,7 @@ public with sharing class DAPV1ParticipantSyncHandler {
                 sa.Status = 'Published with Registrations';
             }
         }
-        if (!toUpd.isEmpty()) apptAccessor.updateServiceAppointments(toUpd);
+        //if (!toUpd.isEmpty()) apptAccessor.updateServiceAppointments(toUpd);
     }
 
     private Map<String, Id> getMatchingAccounts(List<DAPV1AttendanceRequest.ParticipantPayload> participants) {
@@ -377,8 +372,8 @@ public with sharing class DAPV1ParticipantSyncHandler {
         List<Customer> customers = new List<Customer>();
         for (DAPV1AttendanceRequest.ParticipantPayload p : participants) {
             Customer c = new Customer();
-            c.custType     = DAPV1SchedulerConstants.CUSTOMER; // "Customer"
-            c.custId       = p.id; // MID
+            c.custType     = DAPV1SchedulerConstants.CUSTOMER;
+            c.custId       = p.id;
             c.firstName    = p.firstName;
             c.lastName     = p.lastName;
             c.primaryEmail = p.email;
@@ -401,7 +396,7 @@ public with sharing class DAPV1ParticipantSyncHandler {
                 FirstName = p.firstName,
                 LastName  = p.lastName,
                 Email     = p.email,
-                Phone     = p.phone,
+                Phone     = p.phone
             );
             leads.add(l);
             rowToExternalId.put(idx++, p.externalId);
@@ -432,6 +427,7 @@ public with sharing class DAPV1ParticipantSyncHandler {
         return 'Registered';
     }
 }
+
 
 
 public with sharing class DAPV1ParticipantDmlAccessor {
