@@ -208,6 +208,7 @@ public with sharing class DAPV1ParticipantBinProcessorQueueable implements Queue
             '[BinProcessor] Started for binId=' + binRecordId,
             fsReqId, DAPV1ParticipantBinProcessorQueueable.class
         );
+        String runKey = null;  
         try {
             DAP_Participant_Bin__c binRow = DAPV1ParticipantBinRepository.getBin(binRecordId);
             if (binRow == null || String.isBlank(binRow.Participant_Bin__c)) {
@@ -215,6 +216,7 @@ public with sharing class DAPV1ParticipantBinProcessorQueueable implements Queue
                     '[BinProcessor] Missing bin row or JSON for binId=' + binRecordId,
                     fsReqId, DAPV1ParticipantBinProcessorQueueable.class
                 );
+                runKey = binRow.Run_Id__c; 
                 DAPV1ParticipantBinRepository.markFailed(binRecordId);
                 return;
             }
@@ -228,6 +230,8 @@ public with sharing class DAPV1ParticipantBinProcessorQueueable implements Queue
             // Mark completed
             DAPV1ParticipantBinRepository.markCompleted(binRecordId);
 
+            DAPV1ParticipantBinFutureDispatcher.dispatchNext(runKey, fsReqId); // <— ADD THIS
+
             DAPV1SchedulerApiLoggingUtil.logInfo(
                 '[BinProcessor] Completed binId=' + binRecordId,
                 fsReqId, DAPV1ParticipantBinProcessorQueueable.class
@@ -238,6 +242,9 @@ public with sharing class DAPV1ParticipantBinProcessorQueueable implements Queue
                 '[BinProcessor] Failed binId=' + binRecordId + ' err=' + e.getMessage(),
                 fsReqId, DAPV1ParticipantBinProcessorQueueable.class
             );
+            if (runKey != null) {
+                DAPV1ParticipantBinFutureDispatcher.dispatchNext(runKey, fsReqId); // <— ADD THIS
+            }
         }
     }
 }
@@ -608,7 +615,7 @@ public with sharing class DAPV1ParticipantBinDispatchQueueable implements Queuea
 
             // Enqueue the processor for THIS bin (one job)
             String jobId = System.enqueueJob(
-                new DAPV1ParticipantBinProcessorQueueable(nextBin.Id, runId, fsReqId)
+                new DAPV1ParticipantBinProcessorQueueable(nextBin.Id, null, fsReqId)
             );
 
             // Mark the bin as Processing and store job id
@@ -624,6 +631,13 @@ public with sharing class DAPV1ParticipantBinDispatchQueueable implements Queuea
                 fsReqId, DAPV1ParticipantBinDispatchQueueable.class
             );
         }
+    }
+}
+
+public with sharing class DAPV1ParticipantBinFutureDispatcher {
+    @future
+    public static void dispatchNext(String runId, String fsReqId) {
+        System.enqueueJob(new DAPV1ParticipantBinDispatchQueueable(runId, fsReqId));
     }
 }
 
