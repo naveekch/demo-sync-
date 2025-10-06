@@ -548,31 +548,32 @@ public with sharing class DAPV1ParticipantBinRepository {
     // Find the next queued bin for a run and lock it (no ORDER BY + FOR UPDATE).
     // Returns null if no queued bin remains.
     public static DAP_Participant_Bin__c lockNextQueuedBin(String runId) {
-        if (String.isBlank(runId)) return null;
+    if (String.isBlank(runId)) return null;
 
-        // Step 1: compute MIN(sequence) among queued bins (no lock).
-        AggregateResult[] ar = [
-            SELECT MIN(Sequence_Number__c) minSeq
-            FROM DAP_Participant_Bin__c
-            WHERE Run_Id__c = :runId AND Status__c = :STATUS_QUEUED
-            GROUP BY Run_Id__c
-            LIMIT 1
-        ];
-        if (ar.isEmpty() || ar[0].get('minSeq') == null) return null;
+    // 1) Get the smallest sequence among queued bins (aggregate returns Decimal)
+    AggregateResult[] ar = [
+        SELECT MIN(Sequence_Number__c) minSeq
+        FROM DAP_Participant_Bin__c
+        WHERE Run_Id__c = :runId AND Status__c = :STATUS_QUEUED
+        GROUP BY Run_Id__c
+        LIMIT 1
+    ];
+    if (ar.isEmpty() || ar[0].get('minSeq') == null) return null;
 
-        Integer nextSeq = (Integer) ar[0].get('minSeq');
+    Decimal nextSeqDec = (Decimal) ar[0].get('minSeq');
+    Integer nextSeq = nextSeqDec.intValue();
 
-        // Step 2: lock the specific record at that sequence.
-        List<DAP_Participant_Bin__c> rows = [
-            SELECT Id, Run_Id__c, Sequence_Number__c, Status__c, Job_Id__c
-            FROM DAP_Participant_Bin__c
-            WHERE Run_Id__c = :runId
-              AND Status__c = :STATUS_QUEUED
-              AND Sequence_Number__c = :nextSeq
-            LIMIT 1 FOR UPDATE
-        ];
-        return rows.isEmpty() ? null : rows[0];
-    }
+    // 2) Lock that specific row
+    List<DAP_Participant_Bin__c> rows = [
+        SELECT Id, Run_Id__c, Sequence_Number__c, Status__c, Job_Id__c
+        FROM DAP_Participant_Bin__c
+        WHERE Run_Id__c = :runId
+          AND Status__c = :STATUS_QUEUED
+          AND Sequence_Number__c = :nextSeq
+        LIMIT 1 FOR UPDATE
+    ];
+    return rows.isEmpty() ? null : rows[0];
+}
 
     public static void markProcessing(Id binId, String jobId) {
         if (binId == null) return;
