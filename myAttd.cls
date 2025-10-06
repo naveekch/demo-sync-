@@ -49,9 +49,8 @@ global with sharing class DAPV1AttendanceResource {
             List<DAPV1ParticipantBinPayload> bins = packIntoBins(body.appointments);
 
             // 6) Enqueue one job per bin
-            for (DAPV1ParticipantBinPayload bin : bins) {
-                System.enqueueJob(new DAPV1ParticipantBinProcessorQueueable(bin, masterRunId, fsReqId));
-            }
+            DAPV1ParticipantBinRepository.insertBins(masterRunId, bins);
+            System.enqueueJob(new DAPV1ParticipantBinDispatchQueueable(masterRunId, fsReqId));
 
             // 7) Respond 202 Accepted (master run only, per your latest ask)
             DAPV1AttendanceResponse payload = new DAPV1AttendanceResponse();
@@ -194,28 +193,52 @@ public with sharing class DAPV1ParticipantBinPayload {
  * handler to be processed in one single transaction.
  */
 public with sharing class DAPV1ParticipantBinProcessorQueueable implements Queueable {
-
-    private final DAPV1ParticipantBinPayload bin;
+    private final Id binRecordId;
     private final Id runId;
     private final String fsReqId;
 
-    public DAPV1ParticipantBinProcessorQueueable(DAPV1ParticipantBinPayload bin, Id runId, String fsReqId) {
-        this.bin = bin;
+    public DAPV1ParticipantBinProcessorQueueable(Id binRecordId, Id runId, String fsReqId) {
+        this.binRecordId = binRecordId;
         this.runId = runId;
         this.fsReqId = fsReqId;
     }
 
-    public void execute(QueueableContext context) {
-        DAPV1SchedulerApiLoggingUtil.logInfo('[ParticipantBinProcessor] Started for Run ID: ' + runId, fsReqId, DAPV1ParticipantBinProcessorQueueable.class);
+    public void execute(QueueableContext ctx) {
+        DAPV1SchedulerApiLoggingUtil.logInfo(
+            '[BinProcessor] Started for binId=' + binRecordId,
+            fsReqId, DAPV1ParticipantBinProcessorQueueable.class
+        );
         try {
-            // This job's only responsibility is to call the handler to do the work.
-            DAPV1ParticipantSyncHandler handler = new DAPV1ParticipantSyncHandler();
-            handler.processBin(this.bin, this.runId, this.fsReqId);
+            DAP_Participant_Bin__c binRow = DAPV1ParticipantBinRepository.getBin(binRecordId);
+            if (binRow == null || String.isBlank(binRow.Participant_Bin__c)) {
+                DAPV1SchedulerApiLoggingUtil.logError(
+                    '[BinProcessor] Missing bin row or JSON for binId=' + binRecordId,
+                    fsReqId, DAPV1ParticipantBinProcessorQueueable.class
+                );
+                DAPV1ParticipantBinRepository.markFailed(binRecordId);
+                return;
+            }
+
+            DAPV1ParticipantBinPayload bin =
+                (DAPV1ParticipantBinPayload) JSON.deserialize(binRow.Participant_Bin__c, DAPV1ParticipantBinPayload.class);
+
+            // Process the bin (your existing core engine)
+            new DAPV1ParticipantSyncHandler().processBin(bin, runId, fsReqId);
+
+            // Mark completed
+            DAPV1ParticipantBinRepository.markCompleted(binRecordId);
+
+            DAPV1SchedulerApiLoggingUtil.logInfo(
+                '[BinProcessor] Completed binId=' + binRecordId,
+                fsReqId, DAPV1ParticipantBinProcessorQueueable.class
+            );
         } catch (Exception e) {
-            // If the whole transaction fails (e.g., CPU timeout), this is our last chance to log it.
-            DAPV1SchedulerApiLoggingUtil.logError('[ParticipantBinProcessor] Critical error for Run ID: ' + runId + '. Error: ' + e.getMessage(), fsReqId, DAPV1ParticipantBinProcessorQueueable.class);
+            DAPV1ParticipantBinRepository.markFailed(binRecordId);
+            DAPV1SchedulerApiLoggingUtil.logError(
+                '[BinProcessor] Failed binId=' + binRecordId + ' err=' + e.getMessage(),
+                fsReqId, DAPV1ParticipantBinProcessorQueueable.class
+            );
         }
-        DAPV1SchedulerApiLoggingUtil.logInfo('[ParticipantBinProcessor] Finished for Run ID: ' + runId, fsReqId, DAPV1ParticipantBinProcessorQueueable.class);
     }
 }
 
@@ -468,6 +491,138 @@ public with sharing class DAPV1ParticipantDmlAccessor {
                     ' StatusCode=' + (err != null ? String.valueOf(err.getStatusCode()) : 'n/a') +
                     ' Message=' + (err != null ? err.getMessage() : 'n/a'));
             }
+        }
+    }
+}
+
+public with sharing class DAPV1ParticipantBinRepository {
+    private static final String STATUS_QUEUED     = 'Queued';
+    private static final String STATUS_PROCESSING = 'Processing';
+    private static final String STATUS_COMPLETED  = 'Completed';
+    private static final String STATUS_FAILED     = 'Failed';
+
+    // Insert one row per bin; returns the created record Ids.
+    public static List<Id> insertBins(String runId, List<DAPV1ParticipantBinPayload> bins) {
+        if (String.isBlank(runId) || bins == null || bins.isEmpty()) return new List<Id>();
+
+        List<DAP_Participant_Bin__c> rows = new List<DAP_Participant_Bin__c>();
+        Integer seq = 1;
+        for (DAPV1ParticipantBinPayload bin : bins) {
+            // Serialize the bin to Long Text (<=32k). We keep it lean by default serialization.
+            String json = JSON.serialize(bin);
+            rows.add(new DAP_Participant_Bin__c(
+                Run_Id__c            = runId,
+                Sequence_Number__c   = seq++,
+                Status__c            = STATUS_QUEUED,
+                Participant_Bin__c   = json
+            ));
+        }
+        Database.SaveResult[] sr = Database.insert(rows, false);
+
+        List<Id> out = new List<Id>();
+        for (Database.SaveResult r : sr) if (r.isSuccess()) out.add(r.getId());
+        return out;
+    }
+
+    // Find the next queued bin for a run and lock it (no ORDER BY + FOR UPDATE).
+    // Returns null if no queued bin remains.
+    public static DAP_Participant_Bin__c lockNextQueuedBin(String runId) {
+        if (String.isBlank(runId)) return null;
+
+        // Step 1: compute MIN(sequence) among queued bins (no lock).
+        AggregateResult[] ar = [
+            SELECT MIN(Sequence_Number__c) minSeq
+            FROM DAP_Participant_Bin__c
+            WHERE Run_Id__c = :runId AND Status__c = :STATUS_QUEUED
+            GROUP BY Run_Id__c
+            LIMIT 1
+        ];
+        if (ar.isEmpty() || ar[0].get('minSeq') == null) return null;
+
+        Integer nextSeq = (Integer) ar[0].get('minSeq');
+
+        // Step 2: lock the specific record at that sequence.
+        List<DAP_Participant_Bin__c> rows = [
+            SELECT Id, Run_Id__c, Sequence_Number__c, Status__c, Job_Id__c
+            FROM DAP_Participant_Bin__c
+            WHERE Run_Id__c = :runId
+              AND Status__c = :STATUS_QUEUED
+              AND Sequence_Number__c = :nextSeq
+            LIMIT 1 FOR UPDATE
+        ];
+        return rows.isEmpty() ? null : rows[0];
+    }
+
+    public static void markProcessing(Id binId, String jobId) {
+        if (binId == null) return;
+        DAP_Participant_Bin__c row = new DAP_Participant_Bin__c(
+            Id = binId,
+            Status__c = STATUS_PROCESSING,
+            Job_Id__c = jobId
+        );
+        update row;
+    }
+
+    public static void markCompleted(Id binId) {
+        if (binId == null) return;
+        update new DAP_Participant_Bin__c(Id = binId, Status__c = STATUS_COMPLETED);
+    }
+
+    public static void markFailed(Id binId) {
+        if (binId == null) return;
+        update new DAP_Participant_Bin__c(Id = binId, Status__c = STATUS_FAILED);
+    }
+
+    // Fetches the full bin JSON (no lock needed in processor).
+    public static DAP_Participant_Bin__c getBin(Id binId) {
+        if (binId == null) return null;
+        List<DAP_Participant_Bin__c> rows = [
+            SELECT Id, Run_Id__c, Sequence_Number__c, Status__c, Job_Id__c, Participant_Bin__c
+            FROM DAP_Participant_Bin__c
+            WHERE Id = :binId
+            LIMIT 1
+        ];
+        return rows.isEmpty() ? null : rows[0];
+    }
+}
+
+public with sharing class DAPV1ParticipantBinDispatchQueueable implements Queueable {
+    private final String runId;
+    private final String fsReqId;
+
+    public DAPV1ParticipantBinDispatchQueueable(String runId, String fsReqId) {
+        this.runId  = runId;
+        this.fsReqId = fsReqId;
+    }
+
+    public void execute(QueueableContext ctx) {
+        try {
+            DAP_Participant_Bin__c nextBin = DAPV1ParticipantBinRepository.lockNextQueuedBin(runId);
+            if (nextBin == null) {
+                DAPV1SchedulerApiLoggingUtil.logInfo(
+                    '[BinDispatch] No queued bins for runId=' + runId,
+                    fsReqId, DAPV1ParticipantBinDispatchQueueable.class
+                );
+                return;
+            }
+
+            // Enqueue the processor for THIS bin (one job)
+            String jobId = System.enqueueJob(
+                new DAPV1ParticipantBinProcessorQueueable(nextBin.Id, runId, fsReqId)
+            );
+
+            // Mark the bin as Processing and store job id
+            DAPV1ParticipantBinRepository.markProcessing(nextBin.Id, jobId);
+
+            DAPV1SchedulerApiLoggingUtil.logInfo(
+                '[BinDispatch] Dispatched bin seq=' + nextBin.Sequence_Number__c + ' jobId=' + jobId,
+                fsReqId, DAPV1ParticipantBinDispatchQueueable.class
+            );
+        } catch (Exception e) {
+            DAPV1SchedulerApiLoggingUtil.logError(
+                '[BinDispatch] Error: ' + e.getMessage(),
+                fsReqId, DAPV1ParticipantBinDispatchQueueable.class
+            );
         }
     }
 }
