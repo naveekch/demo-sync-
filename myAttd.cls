@@ -264,15 +264,29 @@ public with sharing class DAPV1ParticipantBinProcessorQueueable implements Queue
 }
 
 public with sharing class DAPV1ParticipantSyncHandler {
-    
-    @TestVisible private DAPV1SObjSrvcApptDmlAccessor apptAccessor = new DAPV1SObjSrvcApptDmlAccessor();
+
+    // Still used for MID->Account resolution
     @TestVisible private AccountsService accountsService = new AccountsService();
 
+    /**
+     * Processes one packed bin of participants in a single synchronous transaction.
+     * - Validates SAs and fetches their meeting methods (VLE__c)
+     * - Dedupes by SA+ExternalId, updates status for existing EPs
+     * - Resolves Account by MID or creates Leads when no MID
+     * - Inserts new EPs with proper Meeting Method
+     * - Finalizes SA statuses for SAs completed in this bin
+     */
     public void processBin(DAPV1ParticipantBinPayload bin, Id runId, String fsReqId) {
-        // --- Step 1: Gather participants per SA (Id-keyed) ---
-        Map<Id, List<DAPV1AttendanceRequest.ParticipantPayload>> bySa = new Map<Id, List<DAPV1AttendanceRequest.ParticipantPayload>>();
+        // --- Step 1: Gather participants per SA (Id-keyed)
+        Map<Id, List<DAPV1AttendanceRequest.ParticipantPayload>> bySa =
+            new Map<Id, List<DAPV1AttendanceRequest.ParticipantPayload>>();
+        if (bin == null || bin.slices == null || bin.slices.isEmpty()) return;
+
         for (DAPV1ParticipantBinPayload.ApptSlice slice : bin.slices) {
-            if (slice == null || slice.serviceAppointmentId == null || slice.participants == null || slice.participants.isEmpty()) continue;
+            if (slice == null || slice.serviceAppointmentId == null ||
+                slice.participants == null || slice.participants.isEmpty()) {
+                continue;
+            }
             if (!bySa.containsKey(slice.serviceAppointmentId)) {
                 bySa.put(slice.serviceAppointmentId, new List<DAPV1AttendanceRequest.ParticipantPayload>());
             }
@@ -280,29 +294,39 @@ public with sharing class DAPV1ParticipantSyncHandler {
         }
         if (bySa.isEmpty()) return;
 
-        // --- Step 2: Validate SAs in bulk ---
-        Set<Id> validSaIds = validateServiceAppointments(bySa.keySet(), fsReqId);
+        // --- Step 2: Validate SAs and get meeting methods (VLE__c)
+        Map<Id, String> meetingMethodBySaId =
+            DAPV1ParticipantDmlAccessor.validateAndGetSaMeetingMethods(bySa.keySet(), fsReqId);
+
+        Set<Id> validSaIds = new Set<Id>(meetingMethodBySaId.keySet());
         if (validSaIds.isEmpty()) {
-            DAPV1SchedulerApiLoggingUtil.logError('No valid Service Appointments found in this bin.', fsReqId, DAPV1ParticipantSyncHandler.class);
+            DAPV1SchedulerApiLoggingUtil.logError(
+                'No valid Service Appointments found in this bin.',
+                fsReqId,
+                DAPV1ParticipantSyncHandler.class
+            );
             return;
         }
 
-        // --- Step 3: Dedup query (existing EPs by SA+ExternalId) ---
-        Map<String, DAP_Event_Participant__c> existing = getExistingParticipants(bySa);
+        // --- Step 3: Dedup query (existing EPs by SA+ExternalId)
+        Map<String, DAP_Event_Participant__c> existing =
+            DAPV1ParticipantDmlAccessor.fetchExistingParticipants(bySa);
 
-        // --- Step 4: Triage into updates vs inserts ---
+        // --- Step 4: Triage into updates vs inserts
         List<DAP_Event_Participant__c> toUpdate = new List<DAP_Event_Participant__c>();
         List<DAPV1AttendanceRequest.ParticipantPayload> newCandidates = new List<DAPV1AttendanceRequest.ParticipantPayload>();
-        // Also build a reverse lookup: payload -> SA Id
         Map<DAPV1AttendanceRequest.ParticipantPayload, Id> payloadToSa = new Map<DAPV1AttendanceRequest.ParticipantPayload, Id>();
 
         for (Id saId : bySa.keySet()) {
             if (!validSaIds.contains(saId)) continue;
+
             for (DAPV1AttendanceRequest.ParticipantPayload p : bySa.get(saId)) {
                 payloadToSa.put(p, saId);
-                String k = String.valueOf(saId) + '-' + p.externalId;
-                if (existing.containsKey(k)) {
-                    DAP_Event_Participant__c ep = existing.get(k);
+                String key = String.valueOf(saId) + '-' + p.externalId;
+
+                if (existing.containsKey(key)) {
+                    // Update only status for existing EP
+                    DAP_Event_Participant__c ep = existing.get(key);
                     ep.Status__c = normalizeStatus(p.status);
                     toUpdate.add(ep);
                 } else {
@@ -311,158 +335,88 @@ public with sharing class DAPV1ParticipantSyncHandler {
             }
         }
 
-        // --- Step 5: Insert path (resolve Account by MID; else create Lead) ---
+        // --- Step 5: Insert path (resolve Account by MID; else create Lead)
         List<DAP_Event_Participant__c> toInsert = new List<DAP_Event_Participant__c>();
         if (!newCandidates.isEmpty()) {
             // Split by MID vs no-MID
             List<DAPV1AttendanceRequest.ParticipantPayload> withMid = new List<DAPV1AttendanceRequest.ParticipantPayload>();
             List<DAPV1AttendanceRequest.ParticipantPayload> noMid   = new List<DAPV1AttendanceRequest.ParticipantPayload>();
             for (DAPV1AttendanceRequest.ParticipantPayload p : newCandidates) {
-                if ('mid'.equalsIgnoreCase(p.customerIdtype) && String.isNotBlank(p.id)) withMid.add(p);
-                else noMid.add(p);
+                if ('mid'.equalsIgnoreCase(p.customerIdtype) && String.isNotBlank(p.id)) {
+                    withMid.add(p);
+                } else {
+                    noMid.add(p);
+                }
             }
 
-            Map<String, Id> customerIdToAccountId = getMatchingAccounts(withMid);
-            Map<String, Id> externalIdToLeadId    = createNewLeads(noMid, fsReqId);
+            // Resolve accounts for MIDs
+            Map<String, Id> customerIdToAccountId = new Map<String, Id>();
+            if (!withMid.isEmpty()) {
+                List<Customer> customers = new List<Customer>();
+                for (DAPV1AttendanceRequest.ParticipantPayload p : withMid) {
+                    Customer c = new Customer();
+                    c.custType     = DAPV1SchedulerConstants.CUSTOMER;
+                    c.custId       = p.id;
+                    c.firstName    = p.firstName;
+                    c.lastName     = p.lastName;
+                    c.primaryEmail = p.email;
+                    customers.add(c);
+                }
+                Customers container = new Customers(customers);
+                customerIdToAccountId = accountsService.resolveAccountIds(container); // Map<MID, AccountId>
+            }
 
-            // Assemble EPs
+            // Create Leads for no-MID
+            Map<String, Id> externalIdToLeadId = DAPV1ParticipantDmlAccessor.createNewLeads(noMid, fsReqId);
+
+            // Build EP inserts
             for (DAPV1AttendanceRequest.ParticipantPayload p : newCandidates) {
                 Id saId = payloadToSa.get(p);
                 if (saId == null) continue;
+
+                // Meeting method for this SA
+                String meetingMethod = meetingMethodBySaId.get(saId);
+                if (String.isBlank(meetingMethod)) meetingMethod = 'Virtual';
+
                 DAP_Event_Participant__c ep = new DAP_Event_Participant__c(
                     Service_Appointment__c = saId,
                     ExternalId__c          = p.externalId,
-                    First_Name__c           = p.firstName,
-                    Last_Name__c            = p.lastName,
+                    First_Name__c          = p.firstName,
+                    Last_Name__c           = p.lastName,
                     Notification_Email__c  = p.email,
                     Notification_Phone__c  = p.phone,
                     Status__c              = normalizeStatus(p.status),
-                    Meeting_Method__c      = 'Virtual'
+                    Meeting_Method__c      = meetingMethod
                 );
+
+                // Link Account (via MID) or Lead (no MID)
                 if (String.isNotBlank(p.id) && customerIdToAccountId.containsKey(p.id)) {
                     ep.Account__c = customerIdToAccountId.get(p.id);
                 } else if (externalIdToLeadId.containsKey(p.externalId)) {
                     ep.Lead__c = externalIdToLeadId.get(p.externalId);
                 }
+
                 toInsert.add(ep);
             }
         }
 
+        // --- Step 6: Bulk DML (partial success allowed)
         if (!toInsert.isEmpty())  DAPV1ParticipantDmlAccessor.insertParticipants(toInsert);
         if (!toUpdate.isEmpty())  DAPV1ParticipantDmlAccessor.updateParticipants(toUpdate);
 
-        // --- Step 7: Finalize SA statuses for those completed in this bin ---
+        // --- Step 7: Finalize SA statuses for those completed in this bin
         if (bin.finalizeSaIds != null && !bin.finalizeSaIds.isEmpty()) {
             Set<Id> finalizeValid = new Set<Id>();
             for (Id f : bin.finalizeSaIds) if (validSaIds.contains(f)) finalizeValid.add(f);
-            if (!finalizeValid.isEmpty()) finalizeAppointmentStatuses(finalizeValid);
+            if (!finalizeValid.isEmpty()) {
+                DAPV1ParticipantDmlAccessor.finalizeAppointmentStatuses(finalizeValid);
+            }
         }
     }
 
     /* ===== Helpers ===== */
 
-    private Set<Id> validateServiceAppointments(Set<Id> saIds, String fsReqId) {
-        Set<Id> valid = new Set<Id>();
-        if (saIds == null || saIds.isEmpty()) return valid;
-        Map<Id, ServiceAppointment> found = new Map<Id, ServiceAppointment>(
-            [SELECT Id FROM ServiceAppointment WHERE Id IN :saIds]
-        );
-        for (Id saId : saIds) {
-            if (found.containsKey(saId)) valid.add(saId);
-            else DAPV1SchedulerApiLoggingUtil.logError(
-                'Invalid Service Appointment ID provided in payload: ' + saId, fsReqId, DAPV1ParticipantSyncHandler.class);
-        }
-        return valid;
-    }
-
-    private Map<String, DAP_Event_Participant__c> getExistingParticipants(
-        Map<Id, List<DAPV1AttendanceRequest.ParticipantPayload>> bySa
-    ){
-        Set<String> extIds = new Set<String>();
-        for (Id saId : bySa.keySet()) {
-            for (DAPV1AttendanceRequest.ParticipantPayload p : bySa.get(saId)) {
-                if (String.isNotBlank(p.externalId)) extIds.add(p.externalId);
-            }
-        }
-        Map<String, DAP_Event_Participant__c> out = new Map<String, DAP_Event_Participant__c>();
-        if (extIds.isEmpty()) return out;
-
-        for (DAP_Event_Participant__c ep : [
-            SELECT Id, ExternalId__c, Status__c, Service_Appointment__c
-            FROM DAP_Event_Participant__c
-            WHERE Service_Appointment__c IN :bySa.keySet()
-              AND ExternalId__c IN :extIds
-        ]) {
-            out.put(String.valueOf(ep.Service_Appointment__c) + '-' + ep.ExternalId__c, ep);
-        }
-        return out;
-    }
-
-    private void finalizeAppointmentStatuses(Set<Id> saIds) {
-        List<ServiceAppointment> toUpd = [
-            SELECT Id, Status FROM ServiceAppointment WHERE Id IN :saIds FOR UPDATE
-        ];
-        for (ServiceAppointment sa : toUpd) {
-            if (sa.Status != 'Published with Registrations') {
-                sa.Status = 'Published with Registrations';
-            }
-        }
-        //if (!toUpd.isEmpty()) apptAccessor.updateServiceAppointments(toUpd);
-    }
-
-    private Map<String, Id> getMatchingAccounts(List<DAPV1AttendanceRequest.ParticipantPayload> participants) {
-        if (participants == null || participants.isEmpty()) return new Map<String, Id>();
-        List<Customer> customers = new List<Customer>();
-        for (DAPV1AttendanceRequest.ParticipantPayload p : participants) {
-            Customer c = new Customer();
-            c.custType     = DAPV1SchedulerConstants.CUSTOMER;
-            c.custId       = p.id;
-            c.firstName    = p.firstName;
-            c.lastName     = p.lastName;
-            c.primaryEmail = p.email;
-            customers.add(c);
-        }
-        Customers container = new Customers(customers);
-        return accountsService.resolveAccountIds(container); // returns Map<MID, AccountId>
-    }
-
-    private Map<String, Id> createNewLeads(List<DAPV1AttendanceRequest.ParticipantPayload> participants, String fsReqId) {
-        Map<String, Id> extIdToLeadId = new Map<String, Id>();
-        if (participants == null || participants.isEmpty()) return extIdToLeadId;
-
-        List<Lead> leads = new List<Lead>();
-        Map<Integer, String> rowToExternalId = new Map<Integer, String>();
-
-        Integer idx = 0;
-        for (DAPV1AttendanceRequest.ParticipantPayload p : participants) {
-            Lead l = new Lead(
-                FirstName = p.firstName,
-                LastName  = p.lastName,
-                Email     = p.email,
-                Phone     = p.phone
-            );
-            leads.add(l);
-            rowToExternalId.put(idx++, p.externalId);
-        }
-
-        Database.SaveResult[] sr = Database.insert(leads, false);
-        for (Integer i = 0; i < sr.size(); i++) {
-            if (sr[i].isSuccess()) {
-                String ext = rowToExternalId.get(i);
-                if (String.isNotBlank(ext)) extIdToLeadId.put(ext, sr[i].getId());
-            } else {
-                Database.Error err = sr[i].getErrors().isEmpty() ? null : sr[i].getErrors()[0];
-                DAPV1SchedulerApiLoggingUtil.logError(
-                    'Failed to create Lead for externalId: ' + rowToExternalId.get(i) + 
-                    (err != null ? ('. Error: ' + err.getMessage()) : ''),
-                    fsReqId, DAPV1ParticipantSyncHandler.class
-                );
-            }
-        }
-        return extIdToLeadId;
-    }
-
-    private String normalizeStatus(String status) { 
+    private String normalizeStatus(String status) {
         if (String.isBlank(status)) return 'Registered';
         String s = status.toLowerCase().trim();
         if (s == 'attended') return 'Attended';
@@ -475,14 +429,20 @@ public with sharing class DAPV1ParticipantSyncHandler {
 
 public with sharing class DAPV1ParticipantDmlAccessor {
 
+    /* =========================
+       Participant DML (partial)
+       ========================= */
+
     public static void insertParticipants(List<DAP_Event_Participant__c> participants) {
         if (participants == null || participants.isEmpty()) return;
         try {
             Database.SaveResult[] sr = Database.insert(participants, /* allOrNone */ false);
-            logErrors(sr, participants);
         } catch (Exception e) {
-            System.debug(LoggingLevel.ERROR,
-                'Unexpected error during participant insert: ' + e.getMessage());
+            DAPV1SchedulerApiLoggingUtil.logError(
+                'insertParticipants: unexpected error: ' + e.getMessage(),
+                null,
+                DAPV1ParticipantDmlAccessor.class
+            );
         }
     }
 
@@ -490,27 +450,177 @@ public with sharing class DAPV1ParticipantDmlAccessor {
         if (participants == null || participants.isEmpty()) return;
         try {
             Database.SaveResult[] sr = Database.update(participants, /* allOrNone */ false);
-            logErrors(sr, participants);
         } catch (Exception e) {
-            System.debug(LoggingLevel.ERROR,
-                'Unexpected error during participant update: ' + e.getMessage());
+            DAPV1SchedulerApiLoggingUtil.logError(
+                'updateParticipants: unexpected error: ' + e.getMessage(),
+                null,
+                DAPV1ParticipantDmlAccessor.class
+            );
         }
     }
 
-    private static void logErrors(Database.SaveResult[] results,
-                                  List<DAP_Event_Participant__c> records) {
-        if (results == null) return;
-        for (Integer i = 0; i < results.size(); i++) {
-            if (!results[i].isSuccess()) {
-                Database.Error err = results[i].getErrors().isEmpty()
-                    ? null : results[i].getErrors()[0];
-                DAP_Event_Participant__c rec = (i < records.size()) ? records[i] : null;
-                System.debug(LoggingLevel.ERROR,
-                    'Failed to process participant. ' +
-                    'ExternalId=' + (rec != null ? rec.ExternalId__c : 'UNKNOWN') +
-                    ' StatusCode=' + (err != null ? String.valueOf(err.getStatusCode()) : 'n/a') +
-                    ' Message=' + (err != null ? err.getMessage() : 'n/a'));
+    
+
+    /* ==============================================
+       SA validation + meeting method (VLE__c) fetch
+       ============================================== */
+
+    // Returns SA Id -> meeting method (VLE__c). Logs invalid SA ids.
+    public static Map<Id, String> validateAndGetSaMeetingMethods(Set<Id> saIds, String fsReqId) {
+        Map<Id, String> meetingMethodBySaId = new Map<Id, String>();
+        if (saIds == null || saIds.isEmpty()) return meetingMethodBySaId;
+
+        try {
+            for (ServiceAppointment sa : [
+                SELECT Id, VLE__c
+                FROM ServiceAppointment
+                WHERE Id IN :saIds
+            ]) {
+                meetingMethodBySaId.put(sa.Id, sa.VLE__c);
             }
+        } catch (Exception e) {
+            DAPV1SchedulerApiLoggingUtil.logError(
+                'validateAndGetSaMeetingMethods: query failed. Err=' + e.getMessage(),
+                fsReqId,
+                DAPV1ParticipantDmlAccessor.class
+            );
+            return meetingMethodBySaId;
+        }
+
+        // Log any IDs not found
+        Set<Id> invalid = new Set<Id>(saIds);
+        invalid.removeAll(meetingMethodBySaId.keySet());
+        for (Id bad : invalid) {
+            DAPV1SchedulerApiLoggingUtil.logError(
+                'Invalid Service Appointment ID provided in payload: ' + bad,
+                fsReqId,
+                DAPV1ParticipantDmlAccessor.class
+            );
+        }
+        return meetingMethodBySaId;
+    }
+
+    /* =========================================
+       Existing EP fetch for SA+ExternalId dedupe
+       ========================================= */
+
+    public static Map<String, DAP_Event_Participant__c> fetchExistingParticipants(
+        Map<Id, List<DAPV1AttendanceRequest.ParticipantPayload>> bySa
+    ){
+        Map<String, DAP_Event_Participant__c> existingBySaExtKey = new Map<String, DAP_Event_Participant__c>();
+        if (bySa == null || bySa.isEmpty()) return existingBySaExtKey;
+
+        // Collect external ids present in payload
+        Set<String> extIds = new Set<String>();
+        for (Id saId : bySa.keySet()) {
+            for (DAPV1AttendanceRequest.ParticipantPayload p : bySa.get(saId)) {
+                if (String.isNotBlank(p.externalId)) extIds.add(p.externalId);
+            }
+        }
+        if (extIds.isEmpty()) return existingBySaExtKey;
+
+        try {
+            for (DAP_Event_Participant__c ep : [
+                SELECT Id, ExternalId__c, Status__c, Service_Appointment__c
+                FROM DAP_Event_Participant__c
+                WHERE Service_Appointment__c IN :bySa.keySet()
+                  AND ExternalId__c IN :extIds
+            ]) {
+                existingBySaExtKey.put(
+                    String.valueOf(ep.Service_Appointment__c) + '-' + ep.ExternalId__c,
+                    ep
+                );
+            }
+        } catch (Exception e) {
+            DAPV1SchedulerApiLoggingUtil.logError(
+                'fetchExistingParticipants failed: ' + e.getMessage(),
+                null,
+                DAPV1ParticipantDmlAccessor.class
+            );
+        }
+        return existingBySaExtKey;
+    }
+
+    /* ==========================
+       Lead creation for no-MID
+       ========================== */
+
+    // Creates Leads for participants without MID; returns ExternalId -> LeadId
+    public static Map<String, Id> createNewLeads(
+        List<DAPV1AttendanceRequest.ParticipantPayload> participants,
+        String fsReqId
+    ) {
+        Map<String, Id> extIdToLeadId = new Map<String, Id>();
+        if (participants == null || participants.isEmpty()) return extIdToLeadId;
+
+        List<Lead> leads = new List<Lead>();
+        Map<Integer, String> rowToExternalId = new Map<Integer, String>();
+        Integer idx = 0;
+
+        for (DAPV1AttendanceRequest.ParticipantPayload p : participants) {
+            leads.add(new Lead(
+                FirstName = p.firstName,
+                LastName  = p.lastName,
+                Email     = p.email,
+                Phone     = p.phone
+            ));
+            rowToExternalId.put(idx++, p.externalId);
+        }
+
+        try {
+            Database.SaveResult[] sr = Database.insert(leads, /* allOrNone */ false);
+            for (Integer i = 0; i < sr.size(); i++) {
+                if (sr[i].isSuccess()) {
+                    String ext = rowToExternalId.get(i);
+                    if (String.isNotBlank(ext)) extIdToLeadId.put(ext, sr[i].getId());
+                } else {
+                    Database.Error err = sr[i].getErrors().isEmpty() ? null : sr[i].getErrors()[0];
+                    DAPV1SchedulerApiLoggingUtil.logError(
+                        'createNewLeads: failed for externalId=' + rowToExternalId.get(i) +
+                        (err != null ? ('. Error: ' + err.getMessage()) : ''),
+                        fsReqId,
+                        DAPV1ParticipantDmlAccessor.class
+                    );
+                }
+            }
+        } catch (Exception e) {
+            DAPV1SchedulerApiLoggingUtil.logError(
+                'createNewLeads: unexpected error: ' + e.getMessage(),
+                fsReqId,
+                DAPV1ParticipantDmlAccessor.class
+            );
+        }
+        return extIdToLeadId;
+    }
+
+    /* ============================================
+       Finalize SA status (FOR UPDATE, no ORDER BY)
+       ============================================ */
+
+    public static void finalizeAppointmentStatuses(Set<Id> saIds) {
+        if (saIds == null || saIds.isEmpty()) return;
+
+        try {
+            List<ServiceAppointment> toUpd = [
+                SELECT Id, Status
+                FROM ServiceAppointment
+                WHERE Id IN :saIds
+                FOR UPDATE
+            ];
+            for (ServiceAppointment sa : toUpd) {
+                if (sa.Status != 'Published with Registrations') {
+                    sa.Status = 'Published with Registrations';
+                }
+            }
+            if (!toUpd.isEmpty()) {
+                update toUpd;
+            }
+        } catch (Exception e) {
+            DAPV1SchedulerApiLoggingUtil.logError(
+                'finalizeAppointmentStatuses: update failed. Err=' + e.getMessage(),
+                null,
+                DAPV1ParticipantDmlAccessor.class
+            );
         }
     }
 }
