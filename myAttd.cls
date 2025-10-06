@@ -43,7 +43,7 @@ global with sharing class DAPV1AttendanceResource {
             }
 
             // 4) (UAT placeholder; replace with real tracker in prod)
-            String masterRunId = String.valueOf(Crypto.getRandomUUID());
+            String masterRunId = EncodingUtil.convertToHex(Crypto.generateAesKey(128)); 
 
             // 5) Global pack → fewest bins, track per-bin finalizeSaIds
             List<DAPV1ParticipantBinPayload> bins = packIntoBins(body.appointments);
