@@ -49,9 +49,8 @@ global with sharing class DAPV1AttendanceResource {
             List<DAPV1ParticipantBinPayload> bins = packIntoBins(body.appointments);
 
             // 6) Enqueue one job per bin
-            for (DAPV1ParticipantBinPayload bin : bins) {
-                System.enqueueJob(new DAPV1ParticipantBinProcessorQueueable(bin, masterRunId, fsReqId));
-            }
+            DAPV1ParticipantBinRepository.insertBins(masterRunId, bins);
+            System.enqueueJob(new DAPV1ParticipantBinDispatchQueueable(masterRunId, fsReqId));
 
             // 7) Respond 202 Accepted (master run only, per your latest ask)
             DAPV1AttendanceResponse payload = new DAPV1AttendanceResponse();
