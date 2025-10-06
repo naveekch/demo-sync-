@@ -208,30 +208,43 @@ public with sharing class DAPV1ParticipantBinProcessorQueueable implements Queue
             '[BinProcessor] Started for binId=' + binRecordId,
             fsReqId, DAPV1ParticipantBinProcessorQueueable.class
         );
-        String runKey = null;  
+        String runKey = null;
         try {
             DAP_Participant_Bin__c binRow = DAPV1ParticipantBinRepository.getBin(binRecordId);
+    
+            // Capture runKey safely (binRow may be null)
+            runKey = (binRow != null) ? binRow.Run_Id__c : null;
+    
             if (binRow == null || String.isBlank(binRow.Participant_Bin__c)) {
                 DAPV1SchedulerApiLoggingUtil.logError(
                     '[BinProcessor] Missing bin row or JSON for binId=' + binRecordId,
                     fsReqId, DAPV1ParticipantBinProcessorQueueable.class
                 );
-                runKey = binRow.Run_Id__c; 
                 DAPV1ParticipantBinRepository.markFailed(binRecordId);
+    
+                // Dispatch next bin even on this failure branch
+                if (runKey != null) {
+                    DAPV1ParticipantBinFutureDispatcher.dispatchNext(runKey, fsReqId);
+                }
                 return;
             }
-
+    
             DAPV1ParticipantBinPayload bin =
-                (DAPV1ParticipantBinPayload) JSON.deserialize(binRow.Participant_Bin__c, DAPV1ParticipantBinPayload.class);
-
-            // Process the bin (your existing core engine)
+                (DAPV1ParticipantBinPayload) JSON.deserialize(
+                    binRow.Participant_Bin__c, DAPV1ParticipantBinPayload.class
+                );
+    
+            // Process the bin (runId can be null; handler doesn’t use it functionally)
             new DAPV1ParticipantSyncHandler().processBin(bin, runId, fsReqId);
-
+    
             // Mark completed
             DAPV1ParticipantBinRepository.markCompleted(binRecordId);
-
-            DAPV1ParticipantBinFutureDispatcher.dispatchNext(runKey, fsReqId); // <— ADD THIS
-
+    
+            // Kick off the next bin (separate async txn)
+            if (runKey != null) {
+                DAPV1ParticipantBinFutureDispatcher.dispatchNext(runKey, fsReqId);
+            }
+    
             DAPV1SchedulerApiLoggingUtil.logInfo(
                 '[BinProcessor] Completed binId=' + binRecordId,
                 fsReqId, DAPV1ParticipantBinProcessorQueueable.class
@@ -242,8 +255,9 @@ public with sharing class DAPV1ParticipantBinProcessorQueueable implements Queue
                 '[BinProcessor] Failed binId=' + binRecordId + ' err=' + e.getMessage(),
                 fsReqId, DAPV1ParticipantBinProcessorQueueable.class
             );
+            // Still dispatch the next bin so the run can continue
             if (runKey != null) {
-                DAPV1ParticipantBinFutureDispatcher.dispatchNext(runKey, fsReqId); // <— ADD THIS
+                DAPV1ParticipantBinFutureDispatcher.dispatchNext(runKey, fsReqId);
             }
         }
     }
