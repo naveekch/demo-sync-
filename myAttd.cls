@@ -348,24 +348,8 @@ public with sharing class DAPV1ParticipantSyncHandler {
             }
         }
 
-        DAPV1ParticipantDmlAccessor.DmlStats insStats = new DAPV1ParticipantDmlAccessor.DmlStats();
-        DAPV1ParticipantDmlAccessor.DmlStats updStats = new DAPV1ParticipantDmlAccessor.DmlStats();
-        
-        if (!toInsert.isEmpty()) {
-            insStats = DAPV1ParticipantDmlAccessor.insertParticipants(toInsert);
-        }
-        if (!toUpdate.isEmpty()) {
-            updStats = DAPV1ParticipantDmlAccessor.updateParticipants(toUpdate);
-        }
-        
-        // If ANY insert/update errors (or storage flag) → throw to make the bin fail
-        Boolean hasErrors =
-            (insStats != null && (insStats.errorCount > 0 || insStats.storageLimit)) ||
-            (updStats != null && (updStats.errorCount > 0 || updStats.storageLimit));
-        
-        if (hasErrors) {
-            throw new DmlException('Event Participant DML errors detected; failing this bin.');
-        }
+        if (!toInsert.isEmpty())  DAPV1ParticipantDmlAccessor.insertParticipants(toInsert);
+        if (!toUpdate.isEmpty())  DAPV1ParticipantDmlAccessor.updateParticipants(toUpdate);
 
         // --- Step 7: Finalize SA statuses for those completed in this bin ---
         if (bin.finalizeSaIds != null && !bin.finalizeSaIds.isEmpty()) {
