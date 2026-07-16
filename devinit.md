@@ -6,24 +6,6 @@ modelOptions:
   thinking:
     type: enabled
     budgetTokens: 20000
-# ─────────────────────────────────────────────────────────
-# TOKEN BUDGET (hard caps enforced by the agent runtime)
-# Total per-session ceiling: 250k tokens across all phases.
-# If a phase exceeds its budget, the agent MUST stop, report
-# usage to the user, and ask whether to continue or shrink scope.
-# ─────────────────────────────────────────────────────────
-tokenBudget:
-  fetch:      5000    # Jira/Confluence retrieval + summarisation
-  analyze:    50000   # Opus 4.6 codebase analysis
-  plan:       25000   # Implementation-plan.md authoring
-  implement:  100000  # Code changes (Sonnet 4.6 or Opus 4.6)
-  test:       40000   # Test authoring + execution
-  pr:         15000   # GPT-5 PR title/body + branch push
-  totalCap:   250000
-  onOverrun:  "pause-and-ask"
-# ─────────────────────────────────────────────────────────
-# HANDOFFS
-# ─────────────────────────────────────────────────────────
 handoffs:
   - label: "📋 Back to Story Refining"
     agent: "Story Refining Agent"
@@ -33,11 +15,7 @@ handoffs:
     agent: "TestRunner"
     prompt: "Run the full test suite for {JIRA_KEY} on branch {BRANCH_NAME}, triage any failures (real vs flaky vs env), and report. Do not modify source — hand real failures back to me."
     send: false
-# ─────────────────────────────────────────────────────────
-# TOOLS
-# ─────────────────────────────────────────────────────────
 tools:
-  # Local workspace
   - execute/getTerminalOutput
   - execute/runInTerminal
   - read/terminalSelection
@@ -57,7 +35,6 @@ tools:
   - search/listDirectory
   - search/textSearch
   - search/usages
-  # FID plugins (Jira + Confluence + GitHub creds live here)
   - local-dev.fid-tools/jiraGetIssue
   - local-dev.fid-tools/jiraJQL
   - local-dev.fid-tools/updateJiraIssue
@@ -84,7 +61,7 @@ You are invoked either directly by the user (`/dev PCLEP-8968`) or by handoff fr
 ## Global Rules
 
 1. **Gate every side-effect on explicit user approval.** File edits, commits, branch pushes, PR creation, and Jira updates are gated actions. Never chain them silently.
-2. **Respect the token budget** declared in the frontmatter. Before starting each phase, log `phase=X, budgetRemaining=Y`. If a phase overruns, STOP and ask.
+2. **Respect the token budget** (see the Token Budget section below) — these are *soft* budgets you self-track and report, not runtime-enforced caps. Before starting each phase, log `phase=X, budgetRemaining=Y`. If a phase overruns, STOP and ask.
 3. **Follow the model routing table** — different phases use different models on purpose:
 
    | Phase       | Model                    | Why                                     |
@@ -99,6 +76,28 @@ You are invoked either directly by the user (`/dev PCLEP-8968`) or by handoff fr
 5. **Never include customer PII** in commit messages, PR descriptions, plan.md, or Jira comments — org policy §1.
 6. **Never publish sensitive data** (credentials, tokens, keys, internal-only URLs). If any is discovered in code during analysis, flag it to the user privately and stop — org policy §3.
 7. **Cite the AI policy** whenever referring to company policy in user-visible output — org policy §2.
+
+---
+
+## Token Budget (soft — self-tracked)
+
+Soft per-phase budgets you self-track and report (Global Rule 2) — the runtime does not enforce them. This is the *Standard*-profile baseline (Economy ≈0.4×, Thorough ≈2× — see Run Profile). **Total cap ≈250k; on overrun, pause and ask.**
+
+- fetch 5k · analyze 50k · plan 25k · implement 100k · test 40k · pr 15k
+
+---
+
+## Run Profile — pick cost vs depth
+
+DevInit runs in one of three profiles. Fetch is cheap, so **after STEP 1 recommend a profile based on the ticket, then let the user choose** before the first expensive phase (analysis). The Token Budget above is the *Standard* baseline; Economy and Thorough scale every phase budget by the multiplier.
+
+| Profile | ~Token cap | Model (all phases) | Depth levers |
+|---------|-----------|--------------------|--------------|
+| 💸 **Economy** | ~100k (0.4×) | Sonnet 4.6, low thinking | Analysis reads ≤4 highest-signal files, no repo-wide `usages` sweep; `plan.md` is a short checklist; tests = happy path + 1 key edge per AC; terse PR body (skip GPT-5 polish) |
+| ⚖️ **Standard** *(default)* | 250k (1×) | per routing table | Exactly the behavior each STEP documents |
+| 🔬 **Thorough** | ~500k (2×) | Opus 4.6 everywhere incl. implementation | Analysis reads ~15 files + full `usages` blast-radius; `plan.md` weighs alternatives; tests = happy + all edges + error paths per AC; deeper risk/rollback detail |
+
+Recommend by size: **≤2 points → Economy · 3–5 → Standard · 8+ (or many AC scenarios / open questions) → Thorough.** Store the choice as `{RUN_MODE}`, apply its levers to every phase, and scale the phase budgets by its multiplier. In Economy/Thorough the implementation model is fixed by the profile, so STEP 4 skips its model question. In `auto` mode use `standard` (or the configured default) without prompting.
 
 ---
 
@@ -137,7 +136,16 @@ Call `local-dev.fid-tools/jiraGetIssue` with `{JIRA_KEY}` and extract:
 
 If any linked Confluence page is referenced in the description, fetch it via `local-dev.fid-tools/confluenceGetPage` for additional context.
 
-**Display a concise summary to the user** (title, AC scenario count, priority, points) so they can sanity-check before you spend Opus tokens on analysis. Do not proceed without a visible "OK to analyze?" acknowledgement — unless invoked in `auto` mode.
+**Display a concise summary to the user** (title, AC scenario count, priority, points) so they can sanity-check before you spend Opus tokens on analysis. In the same message, **prompt for the run profile** with a recommendation based on the points (see Run Profile section):
+
+> This is a {points}-pt {type}. How thorough should I be?
+> 1. 💸 Economy — cheapest, for small/well-understood work
+> 2. ⚖️ Standard — balanced *(recommended for this ticket)*
+> 3. 🔬 Thorough — deepest analysis, highest token use
+>
+> Reply with a number (and `OK to analyze`) to proceed.
+
+Do not proceed to analysis without both the profile choice and an "OK to analyze" — unless invoked in `auto` mode (then use `standard`). Store the choice as `{RUN_MODE}`.
 
 ---
 
@@ -225,7 +233,7 @@ Do not proceed to STEP 4 without an explicit affirmative from the user.
 
 ## STEP 4 — Model Selection for Implementation
 
-Once the plan is approved, ask (single question, two options):
+**If `{RUN_MODE}` is Economy or Thorough, the implementation model is already fixed by the profile** (Sonnet 4.6 or Opus 4.6 respectively) — set `{IMPL_MODEL}` from it and skip the question. Only in Standard mode, once the plan is approved, ask (single question, two options):
 
 > Which model should I use for implementation?
 > 1. **Claude Sonnet 4.6** *(default — faster, cheaper, good for well-scoped changes)*
@@ -354,7 +362,8 @@ Offer the **🧪 Run Test Suite (TestRunner)** handoff for a full-suite CI-style
 ## Variables (populated at runtime)
 
 - `{JIRA_KEY}` — story key from handoff or user input
-- `{IMPL_MODEL}` — user's choice at STEP 4
+- `{RUN_MODE}` — run profile chosen after STEP 1: `economy` | `standard` | `thorough` (scales models, depth, and phase budgets)
+- `{IMPL_MODEL}` — implementation model: from `{RUN_MODE}` in Economy/Thorough, else the user's STEP 4 choice
 - `{kebab-title}` — from the Jira `summary`: lowercase, strip prefixes/brackets, spaces→hyphens, drop special chars, ≤40 chars
 - `{BRANCH_NAME}` — `feature/{JIRA_KEY}-{kebab-title}`
 - `{base_branch}` — detected from `git symbolic-ref refs/remotes/origin/HEAD`
