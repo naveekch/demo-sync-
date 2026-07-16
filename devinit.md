@@ -29,9 +29,9 @@ handoffs:
     agent: "Story Refining Agent"
     prompt: "Development is blocked pending story clarification. The story is {JIRA_KEY}. Please re-refine the Acceptance Criteria."
     send: false
-  - label: "🧪 Run Test Suite"
+  - label: "🧪 Run Test Suite (TestRunner)"
     agent: "TestRunner"
-    prompt: "Run the full test suite for the workspace and report results. Feature branch: {BRANCH_NAME}."
+    prompt: "Run the full test suite for {JIRA_KEY} on branch {BRANCH_NAME}, triage any failures (real vs flaky vs env), and report. Do not modify source — hand real failures back to me."
     send: false
 # ─────────────────────────────────────────────────────────
 # TOOLS
@@ -231,7 +231,7 @@ Once the plan is approved, ask (single question, two options):
 > 1. **Claude Sonnet 4.6** *(default — faster, cheaper, good for well-scoped changes)*
 > 2. **Claude Opus 4.6** *(deeper reasoning — pick this when Section 6 has open questions or risks)*
 
-Store the choice as `{IMPL_MODEL}`. Also create a feature branch now:
+Store the choice as `{IMPL_MODEL}`. Also create a feature branch now. Derive `{kebab-title}` from the Jira `summary`: lowercase, strip any prefixes/brackets (e.g. `[Bug Fix]`), replace spaces with hyphens, drop other special characters, truncate to ≤40 chars.
 
 ```
 git checkout -b feature/{JIRA_KEY}-{kebab-title}
@@ -303,7 +303,7 @@ Only on affirmative:
    - **Screenshots / Recordings** — placeholder line `_add if UI change_`.
    - **Rollback** — from plan Section 8.
    - **Jira link** — `Closes {JIRA_URL}`.
-3. `local-dev.fid-tools/githubCreateBranch` (if the remote branch doesn't exist yet) → `githubCommit` (push) → `githubCreatePR`.
+3. **Git model — no double commits.** The commit already exists locally from STEP 7. Push it with terminal git — `git push -u origin feature/{JIRA_KEY}-{kebab-title}` — then use fid-tools only for the PR itself (`githubGetPRTemplate` → `githubCreatePR`). Do **not** also call `githubCommit` to author a second commit via the API. (If your fid-tools flow requires the branch to be created server-side first, call `githubCreateBranch` before the push and skip `githubCommit`.)
 4. On success, post a Jira comment via `jiraAddComment`: `PR raised: {PR_URL}` and add label `In-Review` via `updateJiraIssue`.
 5. Show the user the final PR URL.
 
@@ -324,7 +324,7 @@ Post a final status block:
   • Tokens:     {used}/{cap}
 ```
 
-Offer the **🧪 Run Test Suite** handoff for a full-suite CI-style run, and the **📋 Back to Story Refining** handoff if AC drift was discovered along the way.
+Offer the **🧪 Run Test Suite (TestRunner)** handoff for a full-suite CI-style run with failure triage, and the **📋 Back to Story Refining** handoff if AC drift was discovered along the way.
 
 ---
 
@@ -355,6 +355,7 @@ Offer the **🧪 Run Test Suite** handoff for a full-suite CI-style run, and the
 
 - `{JIRA_KEY}` — story key from handoff or user input
 - `{IMPL_MODEL}` — user's choice at STEP 4
+- `{kebab-title}` — from the Jira `summary`: lowercase, strip prefixes/brackets, spaces→hyphens, drop special chars, ≤40 chars
 - `{BRANCH_NAME}` — `feature/{JIRA_KEY}-{kebab-title}`
 - `{base_branch}` — detected from `git symbolic-ref refs/remotes/origin/HEAD`
 - `{JIRA_URL}` — `https://<your-jira-host>/browse/{JIRA_KEY}` (host resolved by fid-tools)
