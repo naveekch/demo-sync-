@@ -1,8 +1,8 @@
 # Option A — PostgreSQL Only (Aurora PostgreSQL) — WEDAS-1081
 
-> Story: WEDAS-1025 — DR Database Selection and Data Model Strategy  
-> Subtask: WEDAS-1081 — Document Option A  
-> Updated: 2026-07-23  
+> Story: WEDAS-1025 — DR Database Selection and Data Model Strategy 
+> Subtask: WEDAS-1081 — Document Option A 
+> Updated: 2026-07-23 | Revised: 2026-07-30 (Serverless v2 as Phase 1 primary; buffer-aware/allow_overlap constraint; skills gated-off; territory FKs) 
 > Authors: Naveen Chelluboina, team
 
 ---
@@ -15,27 +15,118 @@ Single Aurora PostgreSQL database holds everything: config, resources, appointme
 
 ## 2. Architecture
 
+### 2.1 Phase 1 — Baseline (1 writer + 1 reader on Aurora Serverless v2, ~$150–200/mo idle)
+
+*Start here. Handles our current ~200 MB / few TPS workload with room to spare. The diagram shows the logical writer + reader topology — it's identical on Serverless v2, which auto-scales compute (the `db.r6g.large` labels are the Provisioned equivalent at load, ~$900/mo). See §3.8 for the flavor decision.*
+
 ```
-┌──────────────────────────────────────────────────────────┐
-│                    DAP DR App (Spring Boot)               │
-│                                                          │
-│  ┌──────────────────────────────────────────────────┐   │
-│  │       Spring Data JPA / Hibernate                 │   │
-│  │   Writer endpoint (writes) │ Reader endpoint (reads)│  │
-│  └────────────────────┬───────┴──────────────────────┘  │
-│                       │                                  │
-│                       ▼                                  │
-│  ┌──────────────────────────────────────────────────┐   │
-│  │              Aurora PostgreSQL 15+                 │   │
-│  │                                                    │   │
-│  │   Writer (AZ-a) ──sync──▶ Reader (AZ-b)          │   │
-│  │          │                      │                  │   │
-│  │          ▼                      ▼                  │   │
-│  │   ┌──────────────────────────────────┐            │   │
-│  │   │   Shared Storage (6 copies / 3 AZs)│          │   │
-│  │   └──────────────────────────────────┘            │   │
-│  └──────────────────────────────────────────────────┘   │
-└──────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────┐
+│ DAP DR App (Spring Boot) │
+│ │
+│ CREATE / CANCEL GET / SEARCH / AVAILABILITY │
+│ RESCHEDULE writes reads (9 out of every 10 ops) │
+│ │ │ │
+│ ▼ ▼ │
+│ Writer endpoint Reader endpoint │
+│ (RDS Proxy pool) (RDS Proxy pool) │
+└──────────┬──────────────────────────────┬───────────────────────────┘
+ │ │
+ ▼ ▼
+┌──────────────────┐ ┌──────────────────┐
+│ WRITER instance │ │ READER instance │
+│ db.r6g.large │ │ db.r6g.large │
+│ (AZ-a) │ │ (AZ-b) │
+│ │ │ │
+│ ALL writes go │ │ ALL reads go │
+│ here only │ │ here │
+└────────┬─────────┘ └────────┬─────────┘
+ │ │
+ │ sync lag: ~5–20 ms │
+ │ (shared storage, not │
+ │ streaming replication) │
+ ▼ ▼
+┌─────────────────────────────────────────────────────────┐
+│ SHARED AURORA STORAGE LAYER │
+│ │
+│ AZ-a ████████ copy 1 (primary write) │
+│ ████████ copy 2 │
+│ AZ-b ████████ copy 3 │
+│ ████████ copy 4 ← reader serves from here │
+│ AZ-c ████████ copy 5 │
+│ ████████ copy 6 │
+│ │
+│ 6 copies across 3 availability zones │
+│ Writes quorum: 4 of 6 copies must confirm │
+│ Reads: any available copy │
+│ Storage auto-grows: starts at 10 GB → up to 128 TB │
+└─────────────────────────────────────────────────────────┘
+```
+
+**Key points:**
+- The writer and reader are **separate compute instances** but share the **same storage** — there's no traditional replication stream copying data between them. The reader just reads from the shared layer.
+- **Sync lag ~5–20 ms** — much lower than traditional Postgres streaming replication (~seconds) because there's no data to copy, just a page-cache invalidation signal.
+- If the **writer fails**, Aurora promotes the reader to writer in **< 30 seconds** (no data to catch up on — shared storage means it's already there).
+- **RDS Proxy** sits in front of both endpoints — it pools connections so the app doesn't open hundreds of raw DB connections.
+
+---
+
+### 2.2 Phase 2 — Scale up (1 writer + 2 readers, ~$1,250/mo)
+
+*Add a second reader if read load grows — availability queries are the main driver.*
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│ DAP DR App │
+│ writes reads (load-balanced) │
+│ │ │ │ │
+└─────────────┼────────────────────┼───────────┼───────────────────────┘
+ │ │ │
+ ▼ ▼ ▼
+ ┌────────────────┐ ┌──────────────┐ ┌──────────────┐
+ │ WRITER (AZ-a) │ │ READER 1 │ │ READER 2 │
+ │ db.r6g.large │ │ (AZ-b) │ │ (AZ-c) │
+ │ │ │ db.r6g.large │ │ db.r6g.medium│
+ └───────┬────────┘ └──────┬───────┘ └──────┬───────┘
+ │ │ │
+ └──────────────────┴──────────────────┘
+ │
+ SHARED STORAGE
+ (same 6-copy layer)
+```
+
+**Why 2 readers here:** availability queries are the heaviest reads — they join shifts, the advisor's primary/secondary territory, existing appointments, and operating hours. At higher advisor concurrency, offloading those to two readers prevents them from competing with API reads.
+
+**Cost:** ~$1,250/mo (add ~$350 for the second reader). Still well under the hybrid's $1,340 — *and* correctness stays intact.
+
+---
+
+### 2.3 The full scaling ladder (before you'd ever need a different engine)
+
+```
+Current state
+ │
+ ▼
+① Vertical resize → bigger instance (db.r6g.xlarge → 2xlarge)
+ │ takes minutes, no schema change
+ ▼
+② Add read replicas → up to 15 on Aurora; add one at a time
+ │ each one adds ~$350/mo read capacity
+ ▼
+③ Connection pooling → RDS Proxy already in place
+ │ handles connection spikes without DB changes
+ ▼
+④ Aurora Serverless v2 → auto-scales compute; cheaper when idle
+ │ ~$150–200/mo idle; bursts for DR activation
+ ▼
+⑤ RANGE partition → split service_appointment by sched_start_time
+ │ e.g. monthly partitions; hot data stays small
+ ▼
+⑥ Archive old partitions → detach + archive closed/past appointments
+ │ keeps working set small
+ ▼
+⑦ Different architecture → only if >5M records AND >50:1 reads AND
+ 500+ sustained write TPS all at once
+ (we are orders of magnitude away from this)
 ```
 
 **Extensions**: `pgcrypto` (UUID), `postgis` (proximity), `btree_gist` (overlap exclusion)
@@ -50,22 +141,22 @@ AWS offers three ways to run PostgreSQL. They all run the same PostgreSQL engine
 
 ```
 ┌──────────────────────────────────────────────────────────────────────┐
-│                                                                      │
-│   RDS PostgreSQL          Aurora PostgreSQL       Aurora Serverless v2│
-│   (Standard)              (Provisioned)           (Auto-scaling)     │
-│                                                                      │
-│   Traditional DB          Re-architected          Aurora engine +    │
-│   on EBS volumes          storage layer           elastic compute    │
-│                                                                      │
-│   Manual failover         Auto failover           Auto failover +   │
-│   or Multi-AZ standby     < 30 seconds            auto scale up/down│
-│                                                                      │
-│   2 copies (primary       6 copies across         6 copies across   │
-│   + standby in Multi-AZ)  3 AZs                   3 AZs             │
-│                                                                      │
-│   You manage storage      Storage auto-grows      Storage auto-grows│
-│   size (EBS gp3/io1)      to 128 TB               to 128 TB         │
-│                                                                      │
+│ │
+│ RDS PostgreSQL Aurora PostgreSQL Aurora Serverless v2│
+│ (Standard) (Provisioned) (Auto-scaling) │
+│ │
+│ Traditional DB Re-architected Aurora engine + │
+│ on EBS volumes storage layer elastic compute │
+│ │
+│ Manual failover Auto failover Auto failover + │
+│ or Multi-AZ standby < 30 seconds auto scale up/down│
+│ │
+│ 2 copies (primary 6 copies across 6 copies across │
+│ + standby in Multi-AZ) 3 AZs 3 AZs │
+│ │
+│ You manage storage Storage auto-grows Storage auto-grows│
+│ size (EBS gp3/io1) to 128 TB to 128 TB │
+│ │
 └──────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -97,7 +188,9 @@ AWS offers three ways to run PostgreSQL. They all run the same PostgreSQL engine
 | **Total (active DR)** | **~$640/mo** | **~$900/mo** | **~$350-900/mo** |
 | **Total (idle/standby)** | **~$640/mo** (same — instance runs 24/7) | **~$900/mo** (same) | **~$150-200/mo** (scales down when idle) |
 
-### 3.4 Why Aurora Provisioned Is the Primary Recommendation
+### 3.4 Why Aurora (Either Flavor) Beats Standard RDS
+
+*These factors apply to both Aurora Provisioned and Aurora Serverless v2 — the choice between those two is a cost/usage-pattern decision covered in §3.8.*
 
 | Factor | Why It Matters for DR |
 |---|---|
@@ -111,15 +204,17 @@ AWS offers three ways to run PostgreSQL. They all run the same PostgreSQL engine
 
 Aurora Serverless v2 uses the same Aurora storage engine but auto-scales compute (measured in ACUs — Aurora Capacity Units). It's worth considering because:
 
-- **DR is idle most of the time.** The database sits there receiving sync data but handling no API traffic. Serverless v2 scales down to 0.5 ACU (~$0.12/hour) during idle — saving ~$700/month vs a provisioned instance running 24/7
+- **DR is idle most of the time.** The database sits there receiving sync data but handling no API traffic. Serverless v2 scales down to 0.5 ACU (~$0.06/instance-hr, at ~$0.12/ACU-hr) during idle — saving ~$700/month vs a provisioned instance running 24/7
 - **When DR activates, it scales up.** Burst to 8+ ACUs within seconds to handle the redirected traffic
 - **Same Aurora storage, same failover, same extensions.** No feature compromise
 
 | Scenario | Serverless v2 Cost | Provisioned Cost |
 |---|---|---|
-| Idle standby (95% of the time) | ~$90/mo | ~$900/mo |
+| Idle standby — compute only (95% of the time) | ~$90/mo | ~$900/mo |
 | Active DR burst (5% of the time, 1-2 days/month) | ~$60-100/mo | Already paid |
 | **Blended monthly** | **~$150-200/mo** | **~$900/mo** |
+
+*The ~$90 idle row is **compute only** (two 0.5-ACU floors ≈ $44 each). Adding storage (~$30) and backup (~$20) brings the blended idle total to the ~$150–200/mo used elsewhere in this doc.*
 
 **Trade-off**: cold-start latency when scaling from minimum. First few requests after activation may see 1-2 seconds of added latency while compute scales. Acceptable if DR activation is a manual process with a few minutes of warm-up built in.
 
@@ -135,11 +230,66 @@ For a DR system where fast failover and durability are the entire point, the RDS
 
 | Priority | Choice | Reason |
 |---|---|---|
-| **Primary** | **Aurora PostgreSQL Provisioned** | Fastest failover, most durable, simplest storage, proven at scale. Use db.r6g.large for writer + 1 reader |
-| **Cost-optimized alternative** | **Aurora Serverless v2** | Same engine, same guarantees, but dramatically cheaper when DR is idle. Evaluate if the 1-2 second cold-start on activation is acceptable |
+| **Primary (Phase 1)** | **Aurora Serverless v2** | DR is idle ~95% of the time → ~$150–200/mo idle vs ~$900 fixed. Same engine, same <30s failover, same `btree_gist`. Accept the 1–2 s cold-start behind manual failover |
+| **Switch target (if DR becomes full-time)** | **Aurora PostgreSQL Provisioned** (reserved) | Steady 24/7 load → fixed reservable instance is cheaper and has no cold-start. Instance-class change on the same cluster, not a migration |
 | **Not recommended for this use case** | RDS PostgreSQL Standard | Slower failover, fewer replicas, manual storage — solves none of the problems DR cares about |
 
 All three run the same PostgreSQL engine. The SQL schema, `btree_gist` constraint, JSONB, PostGIS, Spring Data JPA code — all identical across flavors. The choice is purely about infrastructure behavior, not application code.
+
+### 3.8 Detailed Cost Breakdown & Flavor Selection
+
+> **Assumptions:** us-east-1, on-demand pricing, ~200 MB data, baseline **1 writer + 1 reader**. Figures are **planning estimates — validate against the AWS Pricing Calculator** before finalizing. DR runs as a **standby**: idle ~95% of the time, active only during an outage or a drill.
+
+#### Itemized monthly cost (baseline: 1 writer + 1 reader)
+
+| Component | RDS PostgreSQL | Aurora Provisioned | Aurora Serverless v2 |
+|---|---|---|---|
+| Writer | ~$400 (Multi-AZ) | ~$500 (r6g.large) | ~$44 idle (0.5 ACU) → ~$350 at load |
+| Reader (1) | ~$200 | ~$350 | ~$44 idle → ~$175 at load |
+| Storage (~10 GB, auto-grows) | ~$30 | ~$30 | ~$30 |
+| Backup / PITR | ~$10 | ~$20 | ~$20 |
+| RDS Proxy | built-in / minimal | built-in / minimal | built-in / minimal |
+| **Total — running at load** | **~$640** | **~$900** | **~$575** |
+| **Total — idle standby** | **~$640** (fixed 24/7) | **~$900** (fixed 24/7) | **~$150–200** |
+
+RDS and Provisioned bill the **same whether busy or idle** — the instances run 24/7. Serverless v2 bills per **ACU-hour** (~$0.12/ACU-hr), so an idle DR falls to the 0.5-ACU floor (~$44/instance/mo).
+
+#### Provisioned vs Serverless — the decision is about *usage pattern*
+
+| Usage pattern | Aurora Provisioned | Aurora Serverless v2 | Cheaper |
+|---|---|---|---|
+| **Idle standby** (today — idle ~95%) | ~$900/mo fixed | ~$150–200/mo | **Serverless (~5–6×)** |
+| **Occasional activation** (a few drills/outages a month) | ~$900/mo fixed | ~$200–300/mo | Serverless |
+| **Full-time, always at load** (2-yr scenario) | ~$900/mo, **reservable to ~$500–600** | ~$700–900+/mo, not reservable | **Provisioned** |
+
+**Why it flips:** Serverless wins when idle because it scales to a 0.5-ACU floor. But a full-time system runs hot 24/7, so its ACU-hours accumulate to roughly a provisioned instance's cost — *and* Provisioned can layer **Reserved Instances / Savings Plans (~40–50% off)** for steady load, which Serverless can't. So the cheapest choice depends entirely on whether it's a standby or an always-on system.
+
+#### The 2-year "what if DR becomes full-time?" answer
+
+- **Today (standby):** pick **Serverless v2** — idle savings dominate.
+- **If it goes full-time:** switch to **Provisioned** (reserved) — predictable, cheaper at steady load, no cold-start.
+
+**The reassurance — switching is nearly free.** Almost nothing else changes between the two:
+
+- Same Aurora engine, same storage, same 6-copy / 3-AZ durability, same <30s failover, same extensions (`btree_gist`, PostGIS), same SQL, **same application code**.
+- Moving Serverless v2 ⇄ Provisioned is an **instance-class change on the same cluster** — minutes of failover, **no data migration, no schema change, no code change**.
+- The only real differences are **infrastructure / billing behavior**, not features: Serverless auto-scales compute (per-ACU billing, possible 1–2s cold-start on wake); Provisioned is a fixed, reservable instance with no cold-start.
+
+**So we are not locked in.** Start on Serverless v2 for a cheap standby; if DR is promoted to full-time, flip to Provisioned with a config change. The decision is reversible and low-risk.
+
+#### Recommendation
+
+| Horizon | Pick | Why |
+|---|---|---|
+| **Phase 1 — DR standby (now → ~2 yrs)** | **Aurora Serverless v2** | DR is idle ~95% of the time → ~$150–200/mo idle vs ~$900 provisioned fixed. Same engine, same failover, same everything. |
+| **If promoted to full-time (~2 yr scenario)** | **Aurora Provisioned** (reserved) | Steady 24/7 load → fixed reservable instance cheaper + no cold-start |
+| **Not recommended** | RDS PostgreSQL | Slower failover, fewer replicas, manual storage — wrong for DR |
+
+**Why Serverless v2 is the clear Phase 1 pick:** DR is a standby that sleeps until a Salesforce outage. Paying ~$900/mo for a fixed instance that sits idle 95% of the time is wasteful. Serverless v2 scales down to 0.5 ACU (~$0.06/hr) when idle and bursts up in seconds when activated. You get identical correctness guarantees, identical failover (<30s), identical extensions — for roughly **5–6× less cost** during standby.
+
+**The cold-start trade-off:** when Serverless scales up from idle, the first few requests may see 1–2 seconds of added latency while compute spins up. For a **manual failover** (someone clicks "activate DR"), this is fine — build a brief warm-up step into the runbook. If failover ever becomes automated, re-evaluate Provisioned at that point.
+
+**Switching later is a config change, not a migration:** Serverless v2 ⇄ Provisioned is an instance-class swap on the same cluster. No data migration, no schema change, no code change. Start cheap, switch when the usage pattern justifies it.
 
 ---
 
@@ -155,7 +305,7 @@ All three run the same PostgreSQL engine. The SQL schema, `btree_gist` constrain
 | 6. No volatile profile metadata | Not stored; columns don't exist |
 | 7. Failback = batch delta job | `SELECT * FROM service_appointment WHERE sf_id IS NULL` + outbox table tracks publish state |
 | 8. Duration from work_type | `work_type.duration_minutes` joined at read time |
-| 9. Skills out of scope | No skill tables needed for Phase 1 |
+| 9. Skills gated off for Wealth (runtime skill-agnostic) | `skill` / `service_resource_skill` / `work_type_required_skill` are modeled now but gated off via `appointment_scheduling_policy.enforce_skills = FALSE`; WEPA (Phase 2) turns them on — nothing to retrofit |
 | 10. Territory grouping is first-class | `service_territory_group` → `service_territory` hierarchy with hours, caps, timezone |
 | 11. Shared model for Wealth + WPA | One schema, one set of APIs |
 
@@ -175,10 +325,14 @@ CREATE EXTENSION btree_gist;
 ALTER TABLE assigned_resource
 ADD CONSTRAINT no_double_book
 EXCLUDE USING gist (
-    service_resource_id WITH =,
-    tstzrange(sched_start_time, sched_end_time) WITH &&
-) WHERE (status <> 'Canceled');
+ service_resource_id WITH =,
+ tstzrange(sched_start_time, block_end_time) WITH &&
+) WHERE (status <> 'Canceled' AND allow_overlap = FALSE);
 ```
+
+Two details in that constraint:
+- **`block_end_time`, not `sched_end_time`** — the range covers the *block* the advisor's calendar reserves, which is `sched_end_time + work_type.buffer_minutes`. `block_end_time` is a **stored column** on `assigned_resource` (set at booking) because `timestamptz + interval` is only `STABLE` in PostgreSQL and can't appear in a GiST/EXCLUDE expression. `sched_end_time` stays the customer-facing meeting end; when buffer is 0 the two are equal.
+- **`allow_overlap = FALSE`** — `allow_overlap` is a column on `assigned_resource`, default FALSE. Phase 1 Wealth is strict (always FALSE, no override). The WEPA (Phase 2) super-scheduler can set it TRUE to intentionally permit an overlap; such a row drops out of the partial index entirely, so the flag is gated behind `appointment_scheduling_policy.allow_overlap_override` and never set on a Wealth row.
 
 This fires on every write path — API create, reschedule, sync import, bulk load — with zero application code. O(log n) at 200K rows = ~18 comparisons, sub-millisecond.
 
@@ -190,7 +344,7 @@ A single appointment create touches 6 tables (appointment, assigned_resource, at
 
 ### 5.3 Availability Queries Are Native JOINs
 
-Availability calculation pulls shifts + territory members + existing appointments + operating hours + work type duration. In PG this is one SQL query with indexed joins. No app-side stitching across stores.
+Availability calculation pulls shifts + the advisor's primary/secondary territory + existing appointments + operating hours + work type duration. In PG this is one SQL query with indexed joins. No app-side stitching across stores.
 
 ### 5.4 Failback Is a Simple Query
 
@@ -312,10 +466,10 @@ Team is SQL-native. Spring Data JPA, Flyway, pgAdmin, DataGrip — all known. No
 
 ```
 Spring Boot App
-    ├── Spring Data JPA / Hibernate  →  Entity classes
-    ├── HikariCP                     →  Writer + Reader pools
-    ├── Flyway                       →  Versioned migrations
-    └── @Transactional               →  Atomic appointment ops
+ ├── Spring Data JPA / Hibernate → Entity classes
+ ├── HikariCP → Writer + Reader pools
+ ├── Flyway → Versioned migrations
+ └── @Transactional → Atomic appointment ops
 ```
 
 ---
