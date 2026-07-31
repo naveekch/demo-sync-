@@ -16,8 +16,8 @@
 | 6 | Do not store volatile profile metadata | Fetch role/level data from source systems at runtime when needed |
 | 7 | Failback is manual batch delta job | Upsert DR deltas to SF and write sf_id back on success |
 | 8 | Duration comes from work_type | Advisor does not own duration |
-| 9 | Skills filtering out of scope for Wealth | Defer skill-driven availability |
-| 10 | Service territory grouping required | Group-level rules for caps, operating hours, and time zone |
+| 9 | Skills gated off for Wealth (runtime skill-agnostic) | `skill` / `service_resource_skill` / `work_type_required_skill` are modeled in Phase 1 but gated off via `appointment_scheduling_policy.enforce_skills = FALSE`; WEPA (Phase 2) enables them â€” nothing to retrofit |
+| 10 | Service territory grouping required | Group-level rules for operating hours and time zone; the daily appointment cap is territory/branch-scoped (`max_appointment_per_day_constraint` on `service_territory`, enforced app-side) |
 | 11 | Wealth and WPA share one data model | Reuse DB model and APIs; UI may differ |
 
 ---
@@ -60,7 +60,7 @@
 | Priority | Includes |
 |---|---|
 | Must | R1, R2, R3, R4, R5, F1, F2, N1, N2 |
-| Should | F3, F4, N3, N4 |
+| Should | F3, F4, N3, N4, N5 |
 | Could | Additional denormalized projections for read optimization |
 
 ---
