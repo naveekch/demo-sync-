@@ -1,8 +1,8 @@
 # Option B — MongoDB Only — WEDAS-1082b
 
-> Story: WEDAS-1025 — DR Database Selection and Data Model Strategy  
-> Subtask: WEDAS-1082b — Document Mongo-Only Option  
-> Date: 2026-07-23  
+> Story: WEDAS-1025 — DR Database Selection and Data Model Strategy 
+> Subtask: WEDAS-1082b — Document Mongo-Only Option 
+> Date: 2026-07-23 
 > Authors: Naveen Chelluboina, team
 
 ---
@@ -17,24 +17,24 @@ Single MongoDB (or Amazon DocumentDB) instance stores everything — config, res
 
 ```
 ┌──────────────────────────────────────────────────────────┐
-│                  DAP DR App (Spring Boot)                  │
-│                                                          │
-│  ┌──────────────────────────────────────────────────┐   │
-│  │       Spring Data MongoDB                         │   │
-│  │   Writer endpoint (writes) │ Reader endpoint (reads)│  │
-│  └────────────────────┬───────┴──────────────────────┘  │
-│                       │                                  │
-│                       ▼                                  │
-│  ┌──────────────────────────────────────────────────┐   │
-│  │           Amazon DocumentDB (MongoDB 5.0+)        │   │
-│  │                                                    │   │
-│  │   Primary ──sync──▶ Replica                       │   │
-│  │          │                │                        │   │
-│  │          ▼                ▼                        │   │
-│  │   ┌──────────────────────────────────┐            │   │
-│  │   │    Replicated Storage (3 AZs)     │           │   │
-│  │   └──────────────────────────────────┘            │   │
-│  └──────────────────────────────────────────────────┘   │
+│ DAP DR App (Spring Boot) │
+│ │
+│ ┌──────────────────────────────────────────────────┐ │
+│ │ Spring Data MongoDB │ │
+│ │ Writer endpoint (writes) │ Reader endpoint (reads)│ │
+│ └────────────────────┬───────┴──────────────────────┘ │
+│ │ │
+│ ▼ │
+│ ┌──────────────────────────────────────────────────┐ │
+│ │ Amazon DocumentDB (MongoDB 5.0+) │ │
+│ │ │ │
+│ │ Primary ──sync── Replica │ │
+│ │ │ │ │ │
+│ │ ▼ ▼ │ │
+│ │ ┌──────────────────────────────────┐ │ │
+│ │ │ Replicated Storage (3 AZs) │ │ │
+│ │ └──────────────────────────────────┘ │ │
+│ └──────────────────────────────────────────────────┘ │
 └──────────────────────────────────────────────────────────┘
 ```
 
@@ -194,10 +194,10 @@ RTO is within target but tighter than PG-only because team familiarity is lower.
 
 ```
 Spring Boot App
-    ├── Spring Data MongoDB  →  Repository interfaces
-    ├── MongoTemplate        →  Complex aggregation queries
-    ├── No Flyway            →  Schema-less (validation via JSON Schema optional)
-    └── @Transactional       →  Multi-doc txn (limited, fragile)
+ ├── Spring Data MongoDB → Repository interfaces
+ ├── MongoTemplate → Complex aggregation queries
+ ├── No Flyway → Schema-less (validation via JSON Schema optional)
+ └── @Transactional → Multi-doc txn (limited, fragile)
 ```
 
 ---
