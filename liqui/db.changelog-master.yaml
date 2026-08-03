@@ -1,0 +1,28 @@
+# Liquibase master changelog — DR Scheduler baseline.
+#
+# Spring Boot wiring (application.yml):
+#   spring:
+#     liquibase:
+#       change-log: classpath:db/changelog/db.changelog-master.yaml
+#     jpa:
+#       hibernate:
+#         ddl-auto: validate   # migrations own the schema — never let Hibernate generate it
+#
+
+# NOTE: the migration DB user must be a member of rds_superuser to run CREATE EXTENSION
+# (btree_gist, pgcrypto). The Aurora master user qualifies.
+# In a real Spring app these files live under src/main/resources/db/changelog/.
+
+databaseChangeLog:
+  - include:
+      file: 001-extensions.sql
+      relativeToChangelogFile: true
+  - include:
+      file: 002-baseline-schema.sql
+      relativeToChangelogFile: true
+  - include:
+      file: 003-constraints-and-indexes.sql
+      relativeToChangelogFile: true
+  - include:
+      file: 004-triggers.sql
+      relativeToChangelogFile: true
